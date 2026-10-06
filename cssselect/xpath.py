@@ -29,6 +29,7 @@ from cssselect.parser import (
     Pseudo,
     PseudoElement,
     Relation,
+    RelativeSelector,
     Selector,
     SelectorError,
     SpecificityAdjustment,
@@ -344,17 +345,63 @@ class GenericTranslator:
 
     def xpath_relation(self, relation: Relation) -> XPathExpr:
         xpath = self.xpath(relation.selector)
-        combinator = relation.combinator
-        subselector = relation.subselector
-        right = self.xpath(subselector.parsed_tree)
-        method = cast(
-            "Callable[[XPathExpr, XPathExpr], XPathExpr]",
-            getattr(
-                self,
-                f"xpath_relation_{self.combinator_mapping[cast('str', combinator.value)]}_combinator",
-            ),
-        )
-        return method(xpath, right)
+        conditions = [
+            self._xpath_relative_condition(relative)
+            for relative in relation.relative_selector_list
+        ]
+        if len(conditions) == 1:
+            condition = conditions[0]
+        else:
+            condition = " or ".join(f"({c})" for c in conditions)
+        return xpath.add_condition(condition)
+
+    def _xpath_relative_condition(self, relative: RelativeSelector) -> str:
+        """Translate one :has() branch to a predicate evaluated against
+        the candidate element.
+
+        The leading combinator anchors the first step on the descendant,
+        child, adjacent-sibling or following-sibling axis; any further
+        combinators of the complex selector are translated normally.
+        """
+        first, tail = self._split_relative_selector(relative.selector)
+        step = self.xpath(first)
+        combinator = cast("str", relative.combinator.value)
+        if combinator == " ":
+            axis = "descendant::"
+        elif combinator == ">":
+            axis = "./"
+        elif combinator == "+":
+            self._xpath_direct_adjacent_relative_step(step)
+            axis = "following-sibling::"
+        else:  # "~"
+            axis = "following-sibling::"
+        for subselector, sub_combinator in tail:
+            right = self.xpath(subselector)
+            if sub_combinator == " ":
+                # Descendants of the previous relative step (never the
+                # step itself), unlike the top-level translator which
+                # anchors "descendant-or-self" at the context node.
+                step = step.join("/descendant::", right)
+            elif sub_combinator == ">":
+                step = step.join("/", right)
+            elif sub_combinator == "+":
+                step = self.xpath_direct_adjacent_combinator(step, right)
+            else:  # "~"
+                step = step.join("/following-sibling::", right)
+        return f"{axis}{step}"
+
+    @staticmethod
+    def _split_relative_selector(
+        selector: Tree,
+    ) -> tuple[Tree, list[tuple[Tree, str]]]:
+        """Return the first compound selector of a complex selector, then
+        the remaining (subselector, combinator) pairs left to right."""
+        chain: list[tuple[Tree, str]] = []
+        while isinstance(selector, CombinedSelector):
+            chain.append((selector.subselector, selector.combinator))
+            selector = selector.selector
+        chain.reverse()
+        return selector, chain
 
     def xpath_matching(self, matching: Matching) -> XPathExpr:
         return self._xpath_add_selector_list_condition(
@@ -509,35 +556,11 @@ class GenericTranslator:
         """right is a sibling after left, immediately or not"""
         return left.join("/following-sibling::", right)
 
-    # The relative selector is kept in `condition` (instead of being folded
-    # into `path`/`element`) so that `element` stays a plain element name:
-    # later steps such as :first-of-type or :not() read and rewrite it.
-
-    def xpath_relation_descendant_combinator(
-        self, left: XPathExpr, right: XPathExpr
-    ) -> XPathExpr:
-        """right is a child, grand-child or further descendant of left; select left"""
-        return left.add_condition(f"descendant::{right}")
-
-    def xpath_relation_child_combinator(
-        self, left: XPathExpr, right: XPathExpr
-    ) -> XPathExpr:
-        """right is an immediate child of left; select left"""
-        return left.add_condition(f"./{right}")
-
-    def xpath_relation_direct_adjacent_combinator(
-        self, left: XPathExpr, right: XPathExpr
-    ) -> XPathExpr:
-        """right is a sibling immediately after left; select left"""
+    def _xpath_direct_adjacent_relative_step(self, right: XPathExpr) -> None:
+        """Constrain *right*, a following-sibling step, to the immediate
+        sibling: the first sibling and the same element type."""
         right.add_name_test()
         right.add_condition("position() = 1")
-        return left.add_condition(f"following-sibling::{right}")
-
-    def xpath_relation_indirect_adjacent_combinator(
-        self, left: XPathExpr, right: XPathExpr
-    ) -> XPathExpr:
-        """right is a sibling after left, immediately or not; select left"""
-        return left.add_condition(f"following-sibling::{right}")
 
     # Function: dispatch by function/pseudo-class name
 

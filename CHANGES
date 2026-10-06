@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Version 1.6.0
+-------------
+
+Unreleased.
+
+*   Extended the ``:has()`` pseudo-class to accept a relative selector list:
+    each comma-separated branch is a complex selector relative to the
+    candidate element and may chain the descendant, child, next-sibling and
+    subsequent-sibling combinators
+    (e.g. ``:has(> ul > li.active, + section .note)``). Nested ``:has()`` and
+    pseudo-elements inside the argument are rejected, the specificity uses the
+    most specific branch, and commas or parentheses inside quoted attribute
+    values no longer split the argument.
+
 Version 1.5.0
 -------------
 

@@ -113,11 +113,15 @@ be implemented):
   allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope`` are
   also rejected inside them, while ``:has()`` is supported (e.g.
   ``:is(:has(> a))``).
-* The ``:has()`` pseudo-class. Limitation: it takes a single argument, made of
-  an optional leading combinator (``>``, ``+`` or ``~``) followed by one
-  *compound selector* built only from type, class and universal selectors
-  (e.g. ``:has(> a.important)``). Anything else is unsupported, e.g. an ID
-  (``:has(#id)``), or a selector list (``:has(a, b)``).
+* The ``:has()`` pseudo-class with a *relative selector list* argument. Each
+  comma-separated branch is a complex selector relative to the candidate
+  element, with an optional leading combinator (``>``, ``+`` or ``~``); the
+  descendant combinator is implicit when none is given
+  (e.g. ``:has(> ul > li.active, + section .note)``). As required by the
+  specification, nested ``:has()`` and pseudo-elements are rejected inside the
+  argument, and the specificity is that of the most specific branch. Commas
+  and parentheses inside quoted attribute values are not treated as list
+  separators or nested arguments.
 * The ``i`` and ``s`` attribute selector flags, e.g. ``[href^="HTTP" i]``.
   ``i`` makes the value comparison ASCII case-insensitive. ``s`` is accepted
   but has no effect, since attribute values are already compared
