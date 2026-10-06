@@ -17,6 +17,9 @@ Released on 2026-07-27.
 
     * ``:is()``, ``:where()`` and ``:matches()`` pseudo-classes.
 
+    * CSS nesting selector expansion through ``parse_nested()`` and
+      ``GenericTranslator.css_nested_to_xpath()``.
+
     * ``:scope`` pseudo-class.
 
     * ``:only-child`` and ``:only-of-type`` pseudo-classes.

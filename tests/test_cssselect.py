@@ -31,6 +31,7 @@ from cssselect import (
     HTMLTranslator,
     SelectorSyntaxError,
     parse,
+    parse_nested,
 )
 from cssselect.parser import (
     Function,
@@ -390,6 +391,113 @@ class TestCssselect(unittest.TestCase):
             1,
             3,
         )
+
+    def test_nesting(self) -> None:
+        def nested(parent: str, css: str) -> list[str]:
+            return [selector.canonical() for selector in parse_nested(parent, css)]
+
+        def nested_specificity(parent: str, css: str) -> tuple[int, int, int]:
+            selectors = parse_nested(parent, css)
+            assert len(selectors) == 1
+            return selectors[0].specificity()
+
+        assert nested("#a, .b", "&") == [":is(#a, .b)"]
+        assert nested("#a, .b", ".c") == [":is(#a, .b) .c"]
+        assert nested("#a, .b", "> .c") == [":is(#a, .b) > .c"]
+        assert nested("#a, .b", "& .c") == [":is(#a, .b) .c"]
+        assert nested("#a, .b", ".c &") == [".c :is(#a, .b)"]
+        assert nested("#a, .b", "&.c") == [":is(#a, .b).c"]
+        assert nested("#a, .b", "&&") == [":is(#a, .b):is(#a, .b)"]
+        assert nested("#a, .b", "&:not(.c)") == [":is(#a, .b):not(.c)"]
+        assert nested("#a, .b", ":not(&.c)") == [":not(:is(#a, .b).c)"]
+        assert nested("#a, .b", ":where(&.c)") == [":where(:is(#a, .b).c)"]
+        assert nested("#a, .b", "&.x, .y") == [
+            ":is(#a, .b).x",
+            ":is(#a, .b) .y",
+        ]
+        assert nested("#a, .b", ":is(& .c, .d)") == [
+            ":is(:is(#a, .b) .c, .d)"
+        ]
+        assert nested("#a, .b", ":not(&.c)") == [":not(:is(#a, .b).c)"]
+        assert nested("#a, .b", '&[data-x="&"]') == [
+            ":is(#a, .b)[data-x='&']"
+        ]
+        assert nested("#a, .b", r'[data-x="&"]') == [
+            ":is(#a, .b) [data-x='&']"
+        ]
+        assert nested("#a, .b", '&:contains("&")') == [
+            ":is(#a, .b):contains('&')"
+        ]
+        assert nested("#a, .b", r"\&") == [":is(#a, .b) \\&"]
+        assert nested(["#a", parse(".b")[0]], "&") == [":is(#a, .b)"]
+
+        assert nested_specificity("#a, .b", ".c") == (1, 1, 0)
+        assert nested_specificity("div, .b", "&.c") == (0, 2, 0)
+        assert nested_specificity("#a, .b", "&&") == (2, 0, 0)
+        assert nested_specificity("#a, .b", ":not(&)") == (1, 0, 0)
+        assert nested_specificity("#a, .b", ":is(& .c)") == (1, 1, 0)
+
+        with pytest.raises(SelectorSyntaxError):
+            parse("&")
+        with pytest.raises(SelectorSyntaxError):
+            parse_nested("a::before", "&")
+        with pytest.raises(SelectorSyntaxError):
+            parse_nested("#a, .b", ":has(&)")
+        with pytest.raises(ExpressionError):
+            GenericTranslator().css_nested_to_xpath("#a, .b", "&::before")
+        with pytest.raises(ExpressionError):
+            GenericTranslator().css_nested_to_xpath("*:nth-of-type(2)", "&")
+
+    def test_nesting_xpath_selection(self) -> None:
+        document = etree.fromstring(
+            """
+            <root>
+              <div id="id-parent" class="b">
+                <div id="id-child" class="c"/>
+              </div>
+              <section id="class-parent" class="b c">
+                <div id="class-child" class="c"/>
+              </section>
+              <div id="type-parent">
+                <div id="type-child" class="c"/>
+              </div>
+            </root>
+            """
+        )
+        translator = GenericTranslator()
+
+        def select(css: str) -> set[str]:
+            items = typing.cast("list[etree._Element]", document.xpath(css))
+            return {item.get("id", "nil") for item in items}
+
+        descendant_xpath = translator.css_nested_to_xpath("#id-parent, .b", ".c")
+        assert select(descendant_xpath) == select(
+            translator.css_to_xpath(":is(#id-parent, .b) .c")
+        )
+        assert select(descendant_xpath) == {"id-child", "class-child"}
+        assert parse_nested("#id-parent, .b", ".c")[0].specificity() == (1, 1, 0)
+
+        compound_xpath = translator.css_nested_to_xpath("#id-parent, .b", "&.c")
+        assert select(compound_xpath) == select(
+            translator.css_to_xpath(":is(#id-parent, .b).c")
+        )
+        assert select(compound_xpath) == {"class-parent"}
+        compound_selector = parse_nested("#id-parent, .b", "&.c")[0]
+        assert compound_selector.specificity() == (1, 1, 0)
+        assert parse("#id-parent.c")[0].specificity() == (1, 1, 0)
+        assert parse(".b.c")[0].specificity() == (0, 2, 0)
+
+        negation_xpath = translator.css_nested_to_xpath("#id-parent, .b", ":not(&)")
+        assert select(negation_xpath) == select(
+            translator.css_to_xpath(":not(:is(#id-parent, .b))")
+        )
+        assert select(negation_xpath) == {
+            "nil",
+            "id-child",
+            "class-child",
+            "type-parent",
+            "type-child",
+        }
 
     def test_css_export(self) -> None:
         def css2css(css: str, res: str | None = None) -> None:
@@ -995,18 +1103,15 @@ class TestCssselect(unittest.TestCase):
 
         assert LowerValues().css_to_xpath("[Foo=BAR]", prefix="") == "*[@Foo = 'bar']"
 
-        # A member of an :is()/:where() selector list that translates to a
-        # path (rather than a predicate) cannot be embedded in the outer
-        # predicate and is rejected. The parser does not currently produce
-        # such an argument, so build the Matching node directly.
+        # A combined selector in an :is()/:where() list is expressed with a
+        # reverse-axis predicate. The parser allows it from nesting; build
+        # the Matching node directly to exercise this translator path.
         base = parse("x")[0].parsed_tree
         combined = parse("a b")[0].parsed_tree
         matching = Matching(base, [combined])
-        with pytest.raises(
-            ExpressionError,
-            match=r"not supported inside :is\(\), :where\(\) and :matches\(\)",
-        ):
-            GenericTranslator().xpath(matching)
+        assert str(GenericTranslator().xpath(matching)) == (
+            "x[self::b and ancestor::*[self::a]]"
+        )
 
     def test_add_name_test(self) -> None:
         # Directly exercise XPathExpr.add_name_test(), part of the

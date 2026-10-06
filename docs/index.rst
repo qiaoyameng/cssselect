@@ -51,13 +51,14 @@ is a group of two selectors.
 .. _group of selectors: http://www.w3.org/TR/selectors/#grouping
 
 .. autofunction:: parse
+.. autofunction:: parse_nested
 .. autoclass:: Selector()
     :members:
 
 .. autoclass:: FunctionalPseudoElement
 
 .. autoclass:: GenericTranslator
-    :members: css_to_xpath, selector_to_xpath
+    :members: css_to_xpath, css_nested_to_xpath, selector_to_xpath
 
 .. autoclass:: HTMLTranslator
 
@@ -108,10 +109,10 @@ be implemented):
 
 * The ``:scope`` pseudo-class. Limitation: it can only be used at a start of a
   selector.
-* The ``:is()`` and ``:where()`` pseudo-classes. Limitation: their arguments
-  are a comma-separated list of *compound selectors*; combinators are not
-  allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope`` are
-  also rejected inside them, while ``:has()`` is supported (e.g.
+* The ``:is()`` and ``:where()`` pseudo-classes. Their arguments are normally
+  a comma-separated list of *compound selectors*; combinators are allowed in
+  selectors produced by CSS nesting expansion. ``:not()`` and ``:scope`` are
+  rejected in directly parsed arguments, while ``:has()`` is supported (e.g.
   ``:is(:has(> a))``).
 * The ``:has()`` pseudo-class. Limitation: it takes a single argument, made of
   an optional leading combinator (``>``, ``+`` or ``~``) followed by one
@@ -125,6 +126,13 @@ be implemented):
 * The ``:not()`` pseudo-class with a *complex selector* argument, e.g.
   ``:not(a.important[rel] > b)``. Limitation: it takes a single argument, so a
   selector list is unsupported (e.g. ``:not(a, b)``).
+* CSS nesting through :func:`parse_nested` and
+  :meth:`GenericTranslator.css_nested_to_xpath`. Every ``&`` is expanded as
+  ``:is(parent selector list)``; the implicit leading descendant combinator
+  is added when ``&`` is omitted. Nesting inside ``:is()``, ``:where()``,
+  ``:matches()`` and ``:not()`` is supported. As with other unsupported
+  features, pseudo-elements and unsupported pseudo-classes raise an
+  :class:`ExpressionError` when XPath 1.0 cannot express the expanded result.
 
 These are non-standard extensions:
 

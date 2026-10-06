@@ -26,8 +26,10 @@ from cssselect.parser import (
     Hash,
     Matching,
     Negation,
+    Nesting,
     Pseudo,
     PseudoElement,
+    ParentSelectorInput,
     Relation,
     Selector,
     SelectorError,
@@ -35,6 +37,7 @@ from cssselect.parser import (
     Tree,
     ascii_lower,
     parse,
+    parse_nested,
     parse_series,
 )
 
@@ -231,6 +234,18 @@ class GenericTranslator:
             for selector in parse(css)
         )
 
+    def css_nested_to_xpath(
+        self,
+        parent_selectors: ParentSelectorInput,
+        nested_css: str,
+        prefix: str = "descendant-or-self::",
+    ) -> str:
+        """Translate a CSS nesting selector list to XPath."""
+        return " | ".join(
+            self.selector_to_xpath(selector, prefix, translate_pseudo_elements=True)
+            for selector in parse_nested(parent_selectors, nested_css)
+        )
+
     def selector_to_xpath(
         self,
         selector: Selector,
@@ -372,26 +387,21 @@ class GenericTranslator:
         """Add a condition matching any selector of the list
         (for :is() and :where())."""
         condition = ""
-        for e in (self.xpath(selector) for selector in selector_list):
-            if e.path:
-                # Only a combined selector (e.g. "a b") translates to a path,
-                # which cannot be embedded into a predicate of the outer
-                # expression. The parser rejects combinators in these arguments,
-                # so this is only reachable through a hand-built Matching or
-                # SpecificityAdjustment node.
-                raise ExpressionError(
-                    "Combined selectors are not supported inside "
-                    ":is(), :where() and :matches()"
-                )
-            e.add_name_test()
-            if not e.condition:
+        for selector in selector_list:
+            selector_condition = self._xpath_match_condition(selector)
+            if selector_condition is None:
                 # This argument matches any element, so the whole selector
                 # list does too: it adds no condition.
                 return xpath
             condition = (
-                f"({condition}) or ({e.condition})" if condition else e.condition
+                f"({condition}) or ({selector_condition})"
+                if condition
+                else selector_condition
             )
         return xpath.add_condition(condition)
+
+    def xpath_nesting(self, nesting: Nesting) -> XPathExpr:
+        raise ExpressionError("Unexpanded nesting selectors are not supported.")
 
     def xpath_function(self, function: Function) -> XPathExpr:
         """Translate a functional pseudo-class."""
