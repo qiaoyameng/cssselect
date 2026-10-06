@@ -47,6 +47,8 @@ from cssselect.xpath import XPathExpr
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from cssselect import Selector
+
 
 class TestCssselect(unittest.TestCase):
     def test_tokenizer(self) -> None:
@@ -576,30 +578,31 @@ class TestCssselect(unittest.TestCase):
         assert get_error(":not( a )") is None
         assert get_error("e:not(.a )") is None
         assert get_error(":not([a] )") is None
-        # A :not() inside :is()/:where()/:matches() is not a nested :not()
-        # and gets its own message
-        assert get_error(":is(:not(a))") == (
-            ":not() is not supported inside :is(), :where() and :matches()"
-        )
-        assert get_error(":where(:not(a))") == (
-            ":not() is not supported inside :is(), :where() and :matches()"
-        )
+        # A :not() inside :is()/:where() is supported; the strict
+        # :matches() predecessor still rejects it with its own message.
+        assert get_error(":is(:not(a))") is None
+        assert get_error(":where(:not(a))") is None
         assert get_error(":matches(:not(a))") == (
             ":not() is not supported inside :is(), :where() and :matches()"
         )
-        assert get_error(":is(:before)") == (
+        # :is() and :where() have forgiving selector lists: invalid
+        # arguments (pseudo-elements or bad grammar) are silently dropped
+        # instead of failing the whole rule; combinators are supported.
+        assert get_error(":is(:before)") is None
+        assert get_error(":is(a b)") is None
+        assert get_error(":where(:before)") is None
+        assert get_error(":where(a b)") is None
+        # The non-standard :matches() keeps the strict grammar.
+        assert get_error(":matches(:before)") == (
             "Got pseudo-element ::before inside function"
         )
-        assert get_error(":is(a b)") == ("Expected an argument, got <IDENT 'b' at 6>")
-        assert get_error(":where(:before)") == (
-            "Got pseudo-element ::before inside function"
-        )
-        assert get_error(":where(a b)") == (
-            "Expected an argument, got <IDENT 'b' at 9>"
+        assert get_error(":matches(a b)") == (
+            "Expected an argument, got <IDENT 'b' at 11>"
         )
         assert get_error(":is(a") == ("Expected an argument, got <EOF at 5>")
-        assert get_error(":is(a,") == ("Expected selector, got <EOF at 6>")
-        assert get_error(":is(a,)") == ("Expected selector, got <DELIM ')' at 6>")
+        assert get_error(":is(a,") == ("Expected an argument, got <EOF at 6>")
+        # a trailing empty argument is dropped by the forgiving parser
+        assert get_error(":is(a,)") is None
         assert get_error(":where(a") == ("Expected an argument, got <EOF at 8>")
         assert get_error(":scope > div :scope header") == (
             'Got pseudo-class ":scope" not at the start of a selector'
@@ -649,6 +652,174 @@ class TestCssselect(unittest.TestCase):
         assert get_error("e:has(f )") is None
         assert get_error("e:has( > f )") is None
         assert get_error(":has(.a )") is None
+
+    def test_forgiving_selector_lists(self) -> None:
+        def parsed(css: str) -> Selector:
+            selectors = parse(css)
+            assert len(selectors) == 1
+            return selectors[0]
+
+        def canonical(css: str) -> str:
+            return parsed(css).canonical()
+
+        def specificity(css: str) -> tuple[int, int, int]:
+            return parsed(css).specificity()
+
+        def xpath(css: str) -> str:
+            return GenericTranslator().css_to_xpath(css, prefix="")
+
+        # One good branch and one bad branch: only the bad branch is
+        # dropped, the rule as a whole survives.
+        assert repr(parse(":is(div, ???)")[0].parsed_tree) == (
+            "Matching[Element[*]:is(Element[div])]"
+        )
+        assert repr(parse(":where(???, .ok)")[0].parsed_tree) == (
+            "SpecificityAdjustment[Element[*]:where(Class[Element[*].ok])]"
+        )
+        for css in (
+            ":is(div, [)",
+            ":is(div, )",
+            ":is(div, 123)",
+            ":is(:before, div)",
+            ":where(123, div)",
+        ):
+            assert canonical(css) in (":is(div)", ":where(div)")
+        # Only the invalid branch is dropped, valid ones are kept verbatim.
+        assert canonical(":is(#a, ???, .b)") == ":is(#a, .b)"
+        assert canonical(":where(???, .a, #b, ???)") == ":where(.a, #b)"
+
+        # Commas nested inside parentheses do not split branches.
+        assert repr(parse(":is(:is(a, b), .c)")[0].parsed_tree) == (
+            "Matching[Element[*]:is("
+            "Matching[Element[*]:is(Element[a], Element[b])], "
+            "Class[Element[*].c])]"
+        )
+        assert xpath(":is(:is(a, b), .c)") == (
+            "*[((self::a) or (self::b)) or "
+            "(@class and contains(@class, 'c') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' c '))]"
+        )
+        # Neither do commas nested inside (string-valued) brackets.
+        assert canonical(":is([title='a, b'], .c)") == ":is([title='a, b'], .c)"
+
+        # Escaped commas belong to the identifier and are not separators.
+        selector = parsed(r":is(.a\,b)")
+        assert repr(selector.parsed_tree) == (
+            "Matching[Element[*]:is(Class[Element[*].a,b])]"
+        )
+        assert selector.canonical() == r":is(.a\,b)"
+        assert specificity(r":is(.a\,b)") == (0, 1, 0)
+        assert xpath(r":is(.a\,b)") == (
+            "*[@class and contains(@class, 'a,b') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' a,b ')]"
+        )
+
+        # When every branch is dropped, the selector never matches:
+        # its XPath is a false predicate and it contributes no weight,
+        # neither for :is() nor for :where().
+        for css in (":is(???, [)", ":is()", ":is(,)", ":is( , )"):
+            assert canonical(css) == ":is()"
+            assert specificity(css) == (0, 0, 0)
+            assert xpath(css) == "*[0]"
+        for css in (":where(???, [)", ":where()", ":where(,)", ":where( , )"):
+            assert canonical(css) == ":where()"
+            assert specificity(css) == (0, 0, 0)
+            assert xpath(css) == "*[0]"
+        # The weight of the compound selector the pseudo-class applies to
+        # still counts.
+        assert specificity("div:is(???)") == (0, 0, 1)
+        assert specificity("div.e:where(???)") == (0, 1, 1)
+
+        # :is() takes the most specific surviving branch; :where() always
+        # contributes zero, and recovery must not leak child-branch weight.
+        assert specificity(":is(.a, #b, ???)") == (1, 0, 0)
+        assert specificity(":is(???, .a)") == (0, 1, 0)
+        assert specificity(":where(.a, #b, ???)") == (0, 0, 0)
+        assert specificity("div:where(.a, #b)") == (0, 0, 1)
+        assert specificity("div.e:where(#x, ???)") == (0, 1, 1)
+
+        # A complex selector argument is a valid but previously rejected
+        # branch: it parses, has combined specificity/canonical output and
+        # is matched with reverse axes.
+        assert canonical(":is(a > b, ???)") == ":is(a > b)"
+        assert specificity(":is(a b, .c)") == (0, 1, 0)
+        assert xpath(":is(a > b, .c)") == (
+            "*[(self::b and parent::*[self::a]) or "
+            "(@class and contains(@class, 'c') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' c '))]"
+        )
+
+        # A syntactically valid selector the library cannot translate
+        # (unknown pseudo-class) is kept by the parser and rejected
+        # explicitly at translation time: it is not silently dropped.
+        assert canonical(":is(.a, :made-up, .b)") == ":is(.a, :made-up, .b)"
+        assert specificity(":is(.a, :made-up, .b)") == (0, 1, 0)
+        with pytest.raises(ExpressionError, match=":made-up"):
+            xpath(":is(.a, :made-up, .b)")
+        with pytest.raises(ExpressionError, match=":made-up"):
+            xpath(":where(:made-up)")
+
+        # canonical() output round-trips, and the re-parsed form has the
+        # same specificity and XPath.
+        for css in (
+            ":is(.a, ???)",
+            ":where(???, #b)",
+            ":is(:is(a, b), .c)",
+            r":is(.a\,b, ???)",
+            "div:is(a b, ???)",
+        ):
+            canonical_form = canonical(css)
+            reparsed = parsed(canonical_form)
+            assert reparsed.canonical() == canonical_form
+            assert reparsed.specificity() == specificity(css)
+            assert GenericTranslator().selector_to_xpath(
+                reparsed, prefix=""
+            ) == xpath(css)
+
+        # The ordinary top-level selector list stays strict: a single bad
+        # selector invalidates the whole rule.
+        with pytest.raises(SelectorSyntaxError):
+            parse("div, ???")
+        # The non-standard :matches() predecessor is strict too.
+        with pytest.raises(SelectorSyntaxError):
+            parse(":matches(div, ???)")
+
+        # An unclosed forgiving function is still a syntax error (there is
+        # no grammar boundary to recover at).
+        with pytest.raises(SelectorSyntaxError):
+            parse(":is(div, .ok")
+        with pytest.raises(SelectorSyntaxError):
+            parse(":where(")
+
+        # :scope cannot be translated inside :is()/:where() and is rejected
+        # outright even when other branches are valid.
+        for css in (":is(:scope)", ":is(a, :scope, b)", ":where(:scope, .a)"):
+            with pytest.raises(SelectorSyntaxError, match='":scope"'):
+                parse(css)
+
+        # Actual document matching: good branch matches, bad branch is
+        # ignored; an all-invalid list matches nothing.
+        document = etree.fromstring(
+            "<root>"
+            "<a id='one' class='c'/>"
+            "<b id='two' class='c'/>"
+            "<b id='three'/>"
+            "</root>"
+        )
+
+        def ids(css: str) -> list[str]:
+            return [
+                typing.cast("str", element.get("id"))
+                for element in typing.cast(
+                    "list[etree._Element]", document.xpath(xpath(css))
+                )
+            ]
+
+        assert ids(":is(b, ???)") == ["two", "three"]
+        assert ids(":is(???, .c)") == ["one", "two"]
+        assert ids(":where(???, b)") == ["two", "three"]
+        assert ids(":is(???, [)") == []
+        assert ids(":where(???, ???)") == []
 
     def test_translation(self) -> None:
         def xpath(css: str) -> str:
@@ -995,18 +1166,18 @@ class TestCssselect(unittest.TestCase):
 
         assert LowerValues().css_to_xpath("[Foo=BAR]", prefix="") == "*[@Foo = 'bar']"
 
-        # A member of an :is()/:where() selector list that translates to a
-        # path (rather than a predicate) cannot be embedded in the outer
-        # predicate and is rejected. The parser does not currently produce
-        # such an argument, so build the Matching node directly.
+        # A complex selector (with combinators) is a valid :is()/:where()
+        # argument and is matched against the context node with reverse
+        # axes. Build the Matching node directly to also exercise the API.
         base = parse("x")[0].parsed_tree
         combined = parse("a b")[0].parsed_tree
         matching = Matching(base, [combined])
-        with pytest.raises(
-            ExpressionError,
-            match=r"not supported inside :is\(\), :where\(\) and :matches\(\)",
-        ):
-            GenericTranslator().xpath(matching)
+        assert str(GenericTranslator().xpath(matching)) == (
+            "x[self::b and ancestor::*[self::a]]"
+        )
+        # An empty selector list never matches.
+        empty = Matching(base, [])
+        assert str(GenericTranslator().xpath(empty)) == "x[0]"
 
     def test_add_name_test(self) -> None:
         # Directly exercise XPathExpr.add_name_test(), part of the

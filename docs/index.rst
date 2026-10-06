@@ -108,11 +108,19 @@ be implemented):
 
 * The ``:scope`` pseudo-class. Limitation: it can only be used at a start of a
   selector.
-* The ``:is()`` and ``:where()`` pseudo-classes. Limitation: their arguments
-  are a comma-separated list of *compound selectors*; combinators are not
-  allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope`` are
-  also rejected inside them, while ``:has()`` is supported (e.g.
-  ``:is(:has(> a))``).
+* The ``:is()`` and ``:where()`` pseudo-classes, with their forgiving
+  selector lists: an argument that is syntactically invalid is dropped
+  without invalidating the other arguments (e.g. ``:is(.ok, ???)`` behaves
+  like ``:is(.ok)``); if every argument is invalid the selector never
+  matches. Complex selectors with combinators are allowed as arguments
+  (e.g. ``:is(a b)`` or ``:is(a > b)``), as are ``:not()`` and ``:has()``
+  (e.g. ``:is(:has(> a))``). An argument that is syntactically valid but
+  uses an unsupported feature (such as an unknown pseudo-class) is not
+  dropped: it raises an :class:`ExpressionError` at translation time.
+  Limitations: ``:scope`` is rejected inside them, a selector list in
+  ``:not()`` (e.g. ``:is(:not(a, b))``) is treated as an invalid argument,
+  and the non-standard ``:matches()`` predecessor still uses a strict
+  (non-forgiving) grammar.
 * The ``:has()`` pseudo-class. Limitation: it takes a single argument, made of
   an optional leading combinator (``>``, ``+`` or ``~``) followed by one
   *compound selector* built only from type, class and universal selectors

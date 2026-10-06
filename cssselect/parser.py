@@ -325,7 +325,12 @@ class Matching:
 
     def specificity(self) -> tuple[int, int, int]:
         a1, b1, c1 = self.selector.specificity()
-        a2, b2, c2 = max(x.specificity() for x in self.selector_list)
+        # An empty list (every argument dropped by the forgiving parser, or
+        # none at all) never matches and contributes no specificity.
+        a2, b2, c2 = max(
+            (x.specificity() for x in self.selector_list),
+            default=(0, 0, 0),
+        )
         return a1 + a2, b1 + b2, c1 + c2
 
 
@@ -731,10 +736,18 @@ def parse_simple_selector(
                 result = Relation(result, combinator, arguments)
 
             elif ident.lower() in ("matches", "is"):
-                selectors = parse_simple_selector_arguments(stream)
+                if ident.lower() == "is":
+                    # :is() has a forgiving selector list: only syntactically
+                    # invalid arguments are dropped, the whole rule survives.
+                    selectors = parse_forgiving_selector_arguments(stream)
+                else:
+                    # :matches(), the non-standard predecessor of :is(), keeps
+                    # the strict grammar.
+                    selectors = parse_simple_selector_arguments(stream)
                 result = Matching(result, selectors)
             elif ident.lower() == "where":
-                selectors = parse_simple_selector_arguments(stream)
+                # Like :is(), :where() has a forgiving selector list.
+                selectors = parse_forgiving_selector_arguments(stream)
                 result = SpecificityAdjustment(result, selectors)
             else:
                 result = Function(result, ident, parse_arguments(stream))
@@ -817,6 +830,89 @@ def parse_simple_selector_arguments(stream: TokenStream) -> list[Tree]:
             break
         else:
             raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+    return arguments
+
+
+def parse_forgiving_selector_arguments(stream: TokenStream) -> list[Tree]:
+    """Parse a forgiving selector list (the arguments of :is() and
+    :where()).
+
+    Selectors 4 §4.1: when parsing a forgiving list, each comma-separated
+    complex selector is parsed independently, and a branch that is not
+    syntactically valid is dropped without invalidating the others. Only
+    branches up to a top-level comma delimit one another, so commas inside
+    parentheses or brackets do not split a branch.
+
+    Selectors that parse fine but this library cannot translate (e.g. an
+    unknown pseudo-class) are kept: distinguishing a grammar error from an
+    unsupported feature means translation must reject them explicitly with
+    an ExpressionError rather than silently dropping the branch.
+
+    An empty result (every branch invalid, or no branch at all) is valid and
+    represents a selector list that never matches.
+    """
+    # Collect the tokens up to the closing parenthesis, tracking nesting so
+    # that branches are only split at top-level commas. The outer stream
+    # cannot be rewound, so each branch is re-parsed from its own tokens.
+    branch_tokens: list[list[Token]] = [[]]
+    paren_depth = 0
+    bracket_depth = 0
+    while 1:
+        token = stream.next()
+        if token.type == "EOF":
+            raise SelectorSyntaxError(f"Expected an argument, got {token}")
+        if token == ("DELIM", "("):
+            paren_depth += 1
+        elif token == ("DELIM", "["):
+            bracket_depth += 1
+        elif token == ("DELIM", ")"):
+            if paren_depth:
+                paren_depth -= 1
+                branch_tokens[-1].append(token)
+                continue
+            if bracket_depth:
+                # A ')' cannot close a '[': the current branch is malformed
+                # and will be dropped, but the function still ends here.
+                branch_tokens[-1] = []
+            break
+        elif token == ("DELIM", "]"):
+            if bracket_depth:
+                bracket_depth -= 1
+        elif token == ("DELIM", ",") and not paren_depth and not bracket_depth:
+            branch_tokens.append([])
+            continue
+        branch_tokens[-1].append(token)
+
+    arguments: list[Tree] = []
+    for tokens in branch_tokens:
+        # :scope cannot be translated inside :is()/:where(), so it is
+        # rejected before branch parsing, regardless of any other grammar
+        # error in the same branch.
+        for index, token in enumerate(tokens):
+            if token == ("DELIM", ":") and index + 1 < len(tokens):
+                following = tokens[index + 1]
+                if following == ("IDENT", "scope") and (
+                    index == 0 or tokens[index - 1] != ("DELIM", ":")
+                ):
+                    raise SelectorSyntaxError(
+                        'Got pseudo-class ":scope" not at the start of a selector'
+                    )
+        # parse_selector() relies on an EOF token terminating the stream.
+        eof_pos = tokens[-1].pos if tokens else stream.used[-1].pos
+        branch_stream = TokenStream([*tokens, EOFToken(eof_pos)])
+        try:
+            result, pseudo_element = parse_selector(branch_stream)
+        except SelectorSyntaxError:
+            # Recovery at the grammar boundary: drop this branch only.
+            continue
+        if pseudo_element:
+            # Pseudo-elements are not valid arguments: drop the branch.
+            continue
+        if branch_stream.peek().type != "EOF":
+            # The branch did not consume all of its tokens: drop it rather
+            # than translating only part of it.
+            continue
+        arguments.append(result)
     return arguments
 
 

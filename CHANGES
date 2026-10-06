@@ -1,6 +1,27 @@
 Changelog
 =========
 
+Version 1.6.0
+-------------
+
+Unreleased.
+
+*   Implemented the forgiving selector list grammar of the ``:is()`` and
+    ``:where()`` pseudo-classes, as required by Selectors Level 4: each
+    comma-separated argument is parsed independently and a syntactically
+    invalid argument is dropped without invalidating the others (recovery
+    happens at grammar boundaries, accounting for nested parentheses,
+    brackets and escaped commas). When every argument is dropped, the
+    resulting selector never matches (XPath ``[0]``) and contributes no
+    specificity. The ordinary top-level selector list and the non-standard
+    ``:matches()`` pseudo-class keep their strict grammar. A syntactically
+    valid argument that uses an unsupported feature (such as an unknown
+    pseudo-class) is kept by the parser and raises an ``ExpressionError``
+    at translation time instead of being silently ignored.
+
+*   Complex selectors (with combinators) and ``:not()`` are now accepted
+    as ``:is()`` and ``:where()`` arguments.
+
 Version 1.5.0
 -------------
 

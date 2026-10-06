@@ -370,27 +370,27 @@ class GenericTranslator:
         self, xpath: XPathExpr, selector_list: Iterable[Tree]
     ) -> XPathExpr:
         """Add a condition matching any selector of the list
-        (for :is() and :where())."""
+        (for :is(), :where() and :matches())."""
         condition = ""
-        for e in (self.xpath(selector) for selector in selector_list):
-            if e.path:
-                # Only a combined selector (e.g. "a b") translates to a path,
-                # which cannot be embedded into a predicate of the outer
-                # expression. The parser rejects combinators in these arguments,
-                # so this is only reachable through a hand-built Matching or
-                # SpecificityAdjustment node.
-                raise ExpressionError(
-                    "Combined selectors are not supported inside "
-                    ":is(), :where() and :matches()"
-                )
-            e.add_name_test()
-            if not e.condition:
+        for selector in selector_list:
+            # A valid selector the translator cannot support (e.g. an
+            # unknown pseudo-class) must raise an ExpressionError here; it
+            # must not be silently dropped like a syntactically invalid
+            # branch (those never reach the translator).
+            branch_condition = self._xpath_match_condition(selector)
+            if branch_condition is None:
                 # This argument matches any element, so the whole selector
                 # list does too: it adds no condition.
                 return xpath
             condition = (
-                f"({condition}) or ({e.condition})" if condition else e.condition
+                f"({condition}) or ({branch_condition})"
+                if condition
+                else branch_condition
             )
+        if not condition:
+            # Every argument was dropped by the forgiving parser (or the
+            # list is empty): the selector never matches.
+            condition = "0"
         return xpath.add_condition(condition)
 
     def xpath_function(self, function: Function) -> XPathExpr:
