@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from string import ascii_lowercase, ascii_uppercase
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from cssselect.parser import (
     Attrib,
@@ -47,6 +47,26 @@ if TYPE_CHECKING:
 
 class ExpressionError(SelectorError, RuntimeError):
     """Unknown or unsupported selector (eg. pseudo-class)."""
+
+
+class ScopedXPath(NamedTuple):
+    """The result of :meth:`GenericTranslator.css_to_xpath_with_scope`.
+
+    .. attribute:: xpath
+
+        The XPath 1.0 expression as a string. It may reference the scope
+        variable, so it must be evaluated together with :attr:`variables`.
+
+    .. attribute:: variables
+
+        Variable bindings for the XPath engine, mapping the scope variable
+        name to the scope node. Evaluate for example with
+        ``document.xpath(result.xpath, **result.variables)``.
+
+    """
+
+    xpath: str
+    variables: dict[str, Any]
 
 
 #### XPath Helpers
@@ -207,6 +227,15 @@ class GenericTranslator:
     # class used to represent and xpath expression
     xpathexpr_cls = XPathExpr
 
+    #: Name of the XPath variable that :meth:`css_to_xpath_with_scope`
+    #: binds to the scope node. Deliberately unusual, to avoid clashing
+    #: with variables used by the calling application.
+    scope_variable_name = "__cssselect_scope"
+
+    # Set to the scope variable name while a scoped translation is
+    # running, None otherwise (i.e. :scope uses the context node).
+    _scope_variable: str | None = None
+
     def css_to_xpath(self, css: str, prefix: str = "descendant-or-self::") -> str:
         """Translate a *group of selectors* to XPath.
 
@@ -230,6 +259,54 @@ class GenericTranslator:
             self.selector_to_xpath(selector, prefix, translate_pseudo_elements=True)
             for selector in parse(css)
         )
+
+    def css_to_xpath_with_scope(
+        self, css: str, scope: Any, prefix: str = "descendant-or-self::"
+    ) -> ScopedXPath:
+        """Translate a *group of selectors* to XPath, with an explicit scope.
+
+        Unlike :meth:`css_to_xpath`, where ``:scope`` resolves to the
+        context node the expression is evaluated from, here ``:scope`` is
+        bound to one specific node, so the expression can be evaluated
+        from any context (typically the document root) and still select
+        relative to that node. The node does not need to be the document
+        root, and the document is not modified.
+
+        The binding uses node identity, through an XPath variable: it does
+        not rely on any (possibly non-unique) attribute of the node.
+        ``:scope`` is not a sandbox: parts of the selector that CSS allows
+        to match outside of the scope element’s subtree (such as its
+        following siblings) still do.
+
+        :param css:
+            A *group of selectors* as a string.
+        :param scope:
+            The node to bind ``:scope`` to, passed to the XPath engine as
+            a variable (e.g. an lxml element).
+        :param prefix:
+            This string is prepended to the XPath expression for each
+            selector, as in :meth:`css_to_xpath`.
+        :raises:
+            :class:`~cssselect.SelectorSyntaxError` on invalid selectors,
+            :class:`ExpressionError` on unknown/unsupported selectors,
+            or if *scope* is ``None``.
+        :returns:
+            A :class:`ScopedXPath`. Evaluate it for example with
+            ``document.xpath(result.xpath, **result.variables)``.
+
+        """
+        if scope is None:
+            raise ExpressionError(
+                "css_to_xpath_with_scope() requires a node to bind :scope to"
+            )
+        variable = self.scope_variable_name
+        previous = self._scope_variable
+        self._scope_variable = variable
+        try:
+            xpath = self.css_to_xpath(css, prefix)
+        finally:
+            self._scope_variable = previous
+        return ScopedXPath(xpath, {variable: scope})
 
     def selector_to_xpath(
         self,
@@ -738,6 +815,12 @@ class GenericTranslator:
     #     description = product.css(':scope > div::text').get()
     def xpath_scope_pseudo(self, xpath: XPathExpr) -> XPathExpr:
         xpath.add_name_test()
+        if self._scope_variable is not None:
+            # A scope node was bound explicitly (css_to_xpath_with_scope()):
+            # match it by identity. The union of the context node and the
+            # bound node holds a single node iff they are the same node.
+            variable = f"${self._scope_variable}"
+            return xpath.add_condition(f"count(. | {variable}) = count({variable})")
         return xpath.add_condition("position() = 1")
 
     def xpath_first_child_pseudo(self, xpath: XPathExpr) -> XPathExpr:

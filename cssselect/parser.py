@@ -672,17 +672,22 @@ def parse_simple_selector(
                 result = Pseudo(result, ident)
                 if result.ident == "scope":
                     # :scope is only supported at the start of a selector,
-                    # i.e. never in :is()/:where()/:matches() arguments
-                    # (where a preceding comma separates arguments, not
-                    # selectors), and otherwise only when the tokens
-                    # preceding its compound selector are the start of the
-                    # input or a comma.
+                    # i.e. when the tokens preceding its compound selector
+                    # are the start of the input or a comma, or, inside
+                    # :is()/:where()/:matches() arguments, when its compound
+                    # selector starts an argument, i.e. follows the opening
+                    # parenthesis or a comma.
                     preceding = stream.used[:selector_start]
                     while preceding and preceding[-1].type == "S":
                         preceding = preceding[:-1]
-                    if inside_selector_list or (
-                        preceding and not preceding[-1].is_delim(",")
-                    ):
+                    if preceding:
+                        delimiter = preceding[-1]
+                        at_start = delimiter.is_delim(",") or (
+                            inside_selector_list and delimiter.is_delim("(")
+                        )
+                    else:
+                        at_start = True
+                    if not at_start:
                         raise SelectorSyntaxError(
                             'Got pseudo-class ":scope" not at the start of a selector'
                         )

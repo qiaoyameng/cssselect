@@ -57,7 +57,9 @@ is a group of two selectors.
 .. autoclass:: FunctionalPseudoElement
 
 .. autoclass:: GenericTranslator
-    :members: css_to_xpath, selector_to_xpath
+    :members: css_to_xpath, css_to_xpath_with_scope, selector_to_xpath
+
+.. autoclass:: ScopedXPath
 
 .. autoclass:: HTMLTranslator
 
@@ -107,11 +109,15 @@ or not representable in XPath 1.0 so the complete specification is unlikely to
 be implemented):
 
 * The ``:scope`` pseudo-class. Limitation: it can only be used at a start of a
-  selector.
+  selector or at the start of a ``:is()``/``:where()``/``:matches()``
+  argument. By default it resolves to the context node the XPath expression
+  is evaluated from; see
+  :meth:`GenericTranslator.css_to_xpath_with_scope` for binding it to a
+  specific node instead.
 * The ``:is()`` and ``:where()`` pseudo-classes. Limitation: their arguments
   are a comma-separated list of *compound selectors*; combinators are not
-  allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope`` are
-  also rejected inside them, while ``:has()`` is supported (e.g.
+  allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` is also rejected
+  inside them, while ``:has()`` is supported (e.g.
   ``:is(:has(> a))``).
 * The ``:has()`` pseudo-class. Limitation: it takes a single argument, made of
   an optional leading combinator (``>``, ``+`` or ``~``) followed by one

@@ -1,6 +1,18 @@
 Changelog
 =========
 
+Version 1.6.0
+-------------
+
+Not released yet.
+
+*   Added the ``GenericTranslator.css_to_xpath_with_scope()`` method, which
+    binds ``:scope`` to a specific node by identity (through an XPath
+    variable), so that the resulting expression can be evaluated from any
+    context, e.g. the document root, without making that node the document
+    root. ``:scope`` is now also accepted at the start of ``:is()``,
+    ``:where()`` and ``:matches()`` arguments.
+
 Version 1.5.0
 -------------
 

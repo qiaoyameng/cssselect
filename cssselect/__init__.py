@@ -17,13 +17,19 @@ from cssselect.parser import (
     SelectorSyntaxError,
     parse,
 )
-from cssselect.xpath import ExpressionError, GenericTranslator, HTMLTranslator
+from cssselect.xpath import (
+    ExpressionError,
+    GenericTranslator,
+    HTMLTranslator,
+    ScopedXPath,
+)
 
 __all__ = (
     "ExpressionError",
     "FunctionalPseudoElement",
     "GenericTranslator",
     "HTMLTranslator",
+    "ScopedXPath",
     "Selector",
     "SelectorError",
     "SelectorSyntaxError",
