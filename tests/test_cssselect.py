@@ -185,16 +185,37 @@ class TestCssselect(unittest.TestCase):
             "Negation[Element[div]:not(CombinedSelector[Element[a] ~ Element[b]])]"
         ]
         assert parse_many("div:has(div.foo)") == [
-            "Relation[Element[div]:has(Selector[Class[Element[div].foo]])]"
+            (
+                "Relation[Element[div]:has(RelativeSelector["
+                "Selector[Class[Element[div].foo]]])]"
+            )
         ]
         assert parse_many("div:has(> div.foo)") == [
-            "Relation[Element[div]:has(> Selector[Class[Element[div].foo]])]"
+            (
+                "Relation[Element[div]:has(RelativeSelector[> "
+                "Selector[Class[Element[div].foo]]])]"
+            )
         ]
         assert parse_many("div:has(+ div.foo)") == [
-            "Relation[Element[div]:has(+ Selector[Class[Element[div].foo]])]"
+            (
+                "Relation[Element[div]:has(RelativeSelector[+ "
+                "Selector[Class[Element[div].foo]]])]"
+            )
         ]
         assert parse_many("div:has(~ div.foo)") == [
-            "Relation[Element[div]:has(~ Selector[Class[Element[div].foo]])]"
+            (
+                "Relation[Element[div]:has(RelativeSelector[~ "
+                "Selector[Class[Element[div].foo]]])]"
+            )
+        ]
+        assert parse_many("div:has(> ul > li.active, + section .note)") == [
+            (
+                "Relation[Element[div]:has(RelativeSelector[> Selector["
+                "CombinedSelector[Element[ul] > Class[Element[li].active]]]], "
+                "RelativeSelector[+ Selector["
+                "CombinedSelector[Element[section] <followed> "
+                "Class[Element[*].note]]]])]"
+            )
         ]
         assert parse_many("div:is(.foo, #bar)") == [
             "Matching[Element[div]:is(Class[Element[*].foo], Hash[Element[*]#bar])]"
@@ -369,6 +390,12 @@ class TestCssselect(unittest.TestCase):
         assert specificity(":has(foo)") == (0, 0, 1)
         assert specificity(":has(.foo)") == (0, 1, 0)
         assert specificity(":has(> foo)") == (0, 0, 1)
+        assert specificity(":has(foo, #bar.baz)") == (1, 1, 0)
+        assert specificity("div:has(> ul > li.active, + section .note)") == (
+            0,
+            1,
+            3,
+        )
 
         assert specificity(":is(.foo, #bar)") == (1, 0, 0)
         assert specificity(":is(:hover, :visited)") == (0, 1, 0)
@@ -436,6 +463,9 @@ class TestCssselect(unittest.TestCase):
         css2css(":has(> foo)")
         css2css(":has(~ foo)")
         css2css(":has(+ foo)")
+        css2css(":has(foo bar)")
+        css2css(":has(> ul > li.active, + section .note)")
+        css2css(':has([title="a, b(c)"])', ":has([title='a, b(c)'])")
         css2css("div:has(> div.foo)")
         css2css(":is(#bar, .foo)")
         css2css(":is(:focused, :visited)")
@@ -635,16 +665,24 @@ class TestCssselect(unittest.TestCase):
         )
         assert get_error("> div p") == ("Expected selector, got <DELIM '>' at 0>")
 
-        # Unsupported :has() with several arguments
-        assert get_error(":has(a, b)") == ("Expected an argument, got <DELIM ',' at 6>")
-        assert get_error(":has()") == ("Expected selector, got <EOF at 5>")
-        assert get_error(":has(a b)") == ("Expected an argument, got <IDENT 'b' at 7>")
-        assert get_error(":has(a .b)") == ("Expected an argument, got <DELIM '.' at 7>")
+        # :has() takes a relative selector list
+        assert get_error(":has(a, b)") is None
+        assert get_error(":has(a b, > c + d, ~ e f)") is None
+        assert get_error(":has()") == ("Expected selector, got <DELIM ')' at 5>")
+        assert get_error(":has(,)") == ("Expected selector, got <DELIM ',' at 5>")
+        assert get_error(":has(a,)") == ("Expected selector, got <DELIM ')' at 7>")
+        assert get_error(":has(a >)") == ("Expected selector, got <DELIM ')' at 8>")
+        assert get_error(":has(:has(a))") == ("Got nested :has()")
+        assert get_error(":has(:is(:has(a)))") == ("Got nested :has()")
+        assert get_error(":has(:not(:has(a)))") == ("Got nested :has()")
+        assert get_error(":has(::before)") == (
+            "Got pseudo-element ::before inside :has()"
+        )
         # '-' is not a valid relative combinator
-        assert get_error(":has(- p)") == ("Expected an argument, got <DELIM '-' at 5>")
+        assert get_error(":has(- p)") == ("Expected selector, got <DELIM '-' at 5>")
         # Strings and numbers are not selectors
-        assert get_error(':has("a")') == ("Expected an argument, got <STRING 'a' at 5>")
-        assert get_error(":has(1)") == ("Expected an argument, got <NUMBER '1' at 5>")
+        assert get_error(':has("a")') == ("Expected selector, got <STRING 'a' at 5>")
+        assert get_error(":has(1)") == ("Expected selector, got <NUMBER '1' at 5>")
         # Whitespace around a :has() argument is not a combinator
         assert get_error("e:has(f )") is None
         assert get_error("e:has( > f )") is None
@@ -795,6 +833,14 @@ class TestCssselect(unittest.TestCase):
         assert xpath("e.foo:has(f)") == (
             "e[(@class and contains(@class, 'foo') and contains("
             "concat(' ', normalize-space(@class), ' '), ' foo ')) and (descendant::f)]"
+        )
+        assert xpath("e:has(a b, > c > d, + f, ~ g h)") == (
+            "e[(descendant::a/descendant-or-self::*/b) or (./c/d) or "
+            "(following-sibling::*[(self::f) and (position() = 1)]) or "
+            "(following-sibling::g/descendant-or-self::*/h)]"
+        )
+        assert xpath('e:has([title="a, b(c)"])') == (
+            "e[descendant::*[@title = 'a, b(c)']]"
         )
         # Negating :has(): the relative selector must be kept as a predicate,
         # not turned into a literal name test.
@@ -1623,6 +1669,59 @@ class TestCssselect(unittest.TestCase):
             "checkbox-checked",
             "checkbox-disabled-checked",
         ]
+
+    def test_has_relative_selector_list_scope(self) -> None:
+        document = html.document_fromstring(
+            """
+            <root>
+              <parent id="p1">
+                <div id="c1" class="candidate">
+                  <ul><li class="active" id="a1"/></ul>
+                </div>
+                <section><span id="n1"/></section>
+              </parent>
+              <parent id="p2">
+                <div id="c2" class="candidate">
+                  <ul><li id="a2"/></ul>
+                </div>
+                <section><span class="note" id="n2"/></section>
+              </parent>
+              <parent id="p3">
+                <div id="c3" class="candidate">
+                  <ul><li id="a3"/></ul>
+                </div>
+                <section><span id="n3"/></section>
+                <section><span class="note" id="n4"/></section>
+              </parent>
+              <div id="noncandidate">
+                <ul><li class="active" id="a4"/></ul>
+              </div>
+              <parent id="p4">
+                <div id="attr-good" class="candidate">
+                  <a data-value="a, b(c)"/>
+                </div>
+                <div id="attr-bad" class="candidate">
+                  <a data-value="other"/>
+                </div>
+              </parent>
+            </root>
+            """
+        )
+        css_to_xpath = GenericTranslator().css_to_xpath
+
+        def pcss(css: str) -> list[str]:
+            items = typing.cast(
+                "list[etree._Element]", document.xpath(css_to_xpath(css))
+            )
+            return [element.get("id", "nil") for element in items]
+
+        assert pcss(".candidate:has(> ul > li.active, + section .note)") == [
+            "c1",
+            "c2",
+        ]
+        assert pcss(
+            '.candidate:has(> a[data-value="a, b(c)"], > a[data-value="missing"])'
+        ) == ["attr-good"]
 
     def test_select_with_namespace(self) -> None:
         # The document prefix (n) deliberately differs from the selector

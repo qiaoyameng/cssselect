@@ -268,36 +268,47 @@ class Negation:
 
 class Relation:
     """
-    Represents selector:has(subselector)
+    Represents selector:has(relative_selector_list)
     """
 
-    def __init__(self, selector: Tree, combinator: Token, subselector: Selector):
+    def __init__(self, selector: Tree, selector_list: Iterable[RelativeSelector]):
         self.selector = selector
+        self.selector_list = list(selector_list)
+
+    def __repr__(self) -> str:
+        args_str = ", ".join(repr(s) for s in self.selector_list)
+        return f"{self.__class__.__name__}[{self.selector!r}:has({args_str})]"
+
+    def canonical(self) -> str:
+        args_str = ", ".join(selector.canonical() for selector in self.selector_list)
+        return f"{self.selector.canonical()}:has({args_str})"
+
+    def specificity(self) -> tuple[int, int, int]:
+        a1, b1, c1 = self.selector.specificity()
+        a2, b2, c2 = max(selector.specificity() for selector in self.selector_list)
+        return a1 + a2, b1 + b2, c1 + c2
+
+
+class RelativeSelector:
+    """Represents one relative selector in a :has() selector list."""
+
+    def __init__(self, combinator: Token, selector: Selector):
         self.combinator = combinator
-        self.subselector = subselector
+        self.selector = selector
 
     def _combinator_prefix(self) -> str:
-        # The descendant combinator is implicit in :has() arguments.
         if self.combinator.value == " ":
             return ""
         return f"{self.combinator.value} "
 
     def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}[{self.selector!r}"
-            f":has({self._combinator_prefix()}{self.subselector!r})]"
-        )
+        return f"RelativeSelector[{self._combinator_prefix()}{self.selector!r}]"
 
     def canonical(self) -> str:
-        subsel = self.subselector.canonical()
-        if len(subsel) > 1:
-            subsel = subsel.lstrip("*")
-        return f"{self.selector.canonical()}:has({self._combinator_prefix()}{subsel})"
+        return f"{self._combinator_prefix()}{self.selector.canonical()}"
 
     def specificity(self) -> tuple[int, int, int]:
-        a1, b1, c1 = self.selector.specificity()
-        a2, b2, c2 = self.subselector.specificity()
-        return a1 + a2, b1 + b2, c1 + c2
+        return self.selector.specificity()
 
 
 class Matching:
@@ -576,12 +587,20 @@ def parse_selector_group(stream: TokenStream) -> Iterator[Selector]:
             break
 
 
-def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
-    result, pseudo_element = parse_simple_selector(stream)
+def parse_selector(
+    stream: TokenStream,
+    inside_has: bool = False,
+) -> tuple[Tree, PseudoElement | None]:
+    result, pseudo_element = parse_simple_selector(
+        stream,
+        inside_has=inside_has,
+    )
     while 1:
         stream.skip_whitespace()
         peek = stream.peek()
-        if peek in (("EOF", None), ("DELIM", ",")):
+        if peek in (("EOF", None), ("DELIM", ",")) or (
+            inside_has and peek == ("DELIM", ")")
+        ):
             break
         if pseudo_element:
             raise SelectorSyntaxError(
@@ -595,7 +614,10 @@ def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
             # By exclusion, the last parse_simple_selector() ended
             # at peek == ' '
             combinator = " "
-        next_selector, pseudo_element = parse_simple_selector(stream)
+        next_selector, pseudo_element = parse_simple_selector(
+            stream,
+            inside_has=inside_has,
+        )
         result = CombinedSelector(result, combinator, next_selector)
     return result, pseudo_element
 
@@ -604,6 +626,7 @@ def parse_simple_selector(
     stream: TokenStream,
     inside_negation: bool = False,
     inside_selector_list: bool = False,
+    inside_has: bool = False,
 ) -> tuple[Tree, PseudoElement | None]:
     stream.skip_whitespace()
     selector_start = len(stream.used)
@@ -629,7 +652,7 @@ def parse_simple_selector(
         if (
             peek.type in ("S", "EOF")
             or peek.is_delim(",", "+", ">", "~")
-            or (inside_negation and peek == ("DELIM", ")"))
+            or ((inside_negation or inside_has) and peek == ("DELIM", ")"))
         ):
             break
         if pseudo_element:
@@ -697,7 +720,10 @@ def parse_simple_selector(
                 if inside_negation:
                     raise SelectorSyntaxError("Got nested :not()")
                 argument, argument_pseudo_element = parse_simple_selector(
-                    stream, inside_negation=True
+                    stream,
+                    inside_negation=True,
+                    inside_selector_list=inside_selector_list,
+                    inside_has=inside_has,
                 )
                 while 1:
                     # Whitespace before the closing parenthesis is not a
@@ -720,21 +746,30 @@ def parse_simple_selector(
                     else:
                         argument_combinator = " "
                     next_selector, argument_pseudo_element = parse_simple_selector(
-                        stream, inside_negation=True
+                        stream,
+                        inside_negation=True,
+                        inside_selector_list=inside_selector_list,
+                        inside_has=inside_has,
                     )
                     argument = CombinedSelector(
                         argument, argument_combinator, next_selector
                     )
                 result = Negation(result, argument)
             elif ident.lower() == "has":
-                combinator, arguments = parse_relative_selector(stream)
-                result = Relation(result, combinator, arguments)
+                if inside_has:
+                    raise SelectorSyntaxError("Got nested :has()")
+                arguments = parse_relative_selector_list(stream)
+                result = Relation(result, arguments)
 
             elif ident.lower() in ("matches", "is"):
-                selectors = parse_simple_selector_arguments(stream)
+                selectors = parse_simple_selector_arguments(
+                    stream, inside_has=inside_has
+                )
                 result = Matching(result, selectors)
             elif ident.lower() == "where":
-                selectors = parse_simple_selector_arguments(stream)
+                selectors = parse_simple_selector_arguments(
+                    stream, inside_has=inside_has
+                )
                 result = SpecificityAdjustment(result, selectors)
             else:
                 result = Function(result, ident, parse_arguments(stream))
@@ -761,47 +796,43 @@ def parse_arguments(stream: TokenStream) -> list[Token]:  # noqa: RET503
             raise SelectorSyntaxError(f"Expected an argument, got {next_}")
 
 
-def parse_relative_selector(stream: TokenStream) -> tuple[Token, Selector]:
-    stream.skip_whitespace()
-    subselector_tokens: list[Token] = []
-    next_ = stream.next()
-
-    if next_.is_delim("+", ">", "~"):
-        combinator = next_
+def parse_relative_selector_list(stream: TokenStream) -> list[RelativeSelector]:
+    selectors = []
+    while 1:
+        stream.skip_whitespace()
+        if stream.peek() == ("DELIM", ")"):
+            raise SelectorSyntaxError(f"Expected selector, got {stream.peek()}")
+        if stream.peek().is_delim("+", ">", "~"):
+            combinator = stream.next()
+        else:
+            combinator = Token("DELIM", " ", pos=stream.peek().pos)
+        result, pseudo_element = parse_selector(stream, inside_has=True)
+        if pseudo_element:
+            raise SelectorSyntaxError(
+                f"Got pseudo-element ::{pseudo_element} inside :has()"
+            )
         stream.skip_whitespace()
         next_ = stream.next()
-    else:
-        combinator = Token("DELIM", " ", pos=0)
-
-    seen_whitespace = False
-    while 1:
-        if next_.type == "S":
-            # Whitespace is valid before the closing parenthesis; anywhere
-            # else it would be a descendant combinator, which is not
-            # supported in :has() arguments.
-            seen_whitespace = True
-        elif next_.type == "IDENT" or next_.is_delim(".", "*"):
-            if seen_whitespace:
-                raise SelectorSyntaxError(f"Expected an argument, got {next_}")
-            subselector_tokens.append(next_)
-        elif next_.is_delim(")"):
+        if next_ == ("DELIM", ","):
+            selectors.append(RelativeSelector(combinator, Selector(result)))
+        elif next_ == ("DELIM", ")"):
+            selectors.append(RelativeSelector(combinator, Selector(result)))
             break
         else:
             raise SelectorSyntaxError(f"Expected an argument, got {next_}")
-        next_ = stream.next()
-
-    # Reparse the collected tokens instead of their concatenated source
-    # text, so that escaped identifiers are preserved.
-    subselector_tokens.append(EOFToken(next_.pos))
-    result, _ = parse_simple_selector(TokenStream(subselector_tokens))
-    return combinator, Selector(result)
+    return selectors
 
 
-def parse_simple_selector_arguments(stream: TokenStream) -> list[Tree]:
+def parse_simple_selector_arguments(
+    stream: TokenStream, inside_has: bool = False
+) -> list[Tree]:
     arguments = []
     while 1:
         result, pseudo_element = parse_simple_selector(
-            stream, inside_negation=True, inside_selector_list=True
+            stream,
+            inside_negation=True,
+            inside_selector_list=True,
+            inside_has=inside_has,
         )
         if pseudo_element:
             raise SelectorSyntaxError(

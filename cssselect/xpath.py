@@ -28,6 +28,7 @@ from cssselect.parser import (
     Negation,
     Pseudo,
     PseudoElement,
+    RelativeSelector,
     Relation,
     Selector,
     SelectorError,
@@ -344,17 +345,52 @@ class GenericTranslator:
 
     def xpath_relation(self, relation: Relation) -> XPathExpr:
         xpath = self.xpath(relation.selector)
-        combinator = relation.combinator
-        subselector = relation.subselector
-        right = self.xpath(subselector.parsed_tree)
-        method = cast(
-            "Callable[[XPathExpr, XPathExpr], XPathExpr]",
-            getattr(
-                self,
-                f"xpath_relation_{self.combinator_mapping[cast('str', combinator.value)]}_combinator",
-            ),
-        )
-        return method(xpath, right)
+        conditions = [
+            self._xpath_relative_selector(selector)
+            for selector in relation.selector_list
+        ]
+        if len(conditions) == 1:
+            condition = conditions[0]
+        else:
+            condition = " or ".join(f"({item})" for item in conditions)
+        return xpath.add_condition(condition)
+
+    def _xpath_relative_selector(self, selector: RelativeSelector) -> str:
+        nodes: list[Tree] = []
+        combinators: list[str] = []
+        tree: Tree = selector.selector.parsed_tree
+        while isinstance(tree, CombinedSelector):
+            nodes.append(tree.subselector)
+            combinators.append(tree.combinator)
+            tree = tree.selector
+        nodes.append(tree)
+        nodes.reverse()
+        combinators.reverse()
+
+        result = self.xpath(nodes[0])
+        leading_combinator = cast("str", selector.combinator.value)
+        if leading_combinator == " ":
+            result.path = "descendant::" + result.path
+        elif leading_combinator == ">":
+            result.path = "./" + result.path
+        elif leading_combinator == "+":
+            result.path = "following-sibling::" + result.path
+            result.add_name_test()
+            result.add_condition("position() = 1")
+        else:
+            result.path = "following-sibling::" + result.path
+
+        for node, combinator in zip(nodes[1:], combinators):
+            next_expr = self.xpath(node)
+            method = cast(
+                "Callable[[XPathExpr, XPathExpr], XPathExpr]",
+                getattr(
+                    self,
+                    f"xpath_{self.combinator_mapping[combinator]}_combinator",
+                ),
+            )
+            result = method(result, next_expr)
+        return str(result)
 
     def xpath_matching(self, matching: Matching) -> XPathExpr:
         return self._xpath_add_selector_list_condition(
@@ -508,36 +544,6 @@ class GenericTranslator:
     ) -> XPathExpr:
         """right is a sibling after left, immediately or not"""
         return left.join("/following-sibling::", right)
-
-    # The relative selector is kept in `condition` (instead of being folded
-    # into `path`/`element`) so that `element` stays a plain element name:
-    # later steps such as :first-of-type or :not() read and rewrite it.
-
-    def xpath_relation_descendant_combinator(
-        self, left: XPathExpr, right: XPathExpr
-    ) -> XPathExpr:
-        """right is a child, grand-child or further descendant of left; select left"""
-        return left.add_condition(f"descendant::{right}")
-
-    def xpath_relation_child_combinator(
-        self, left: XPathExpr, right: XPathExpr
-    ) -> XPathExpr:
-        """right is an immediate child of left; select left"""
-        return left.add_condition(f"./{right}")
-
-    def xpath_relation_direct_adjacent_combinator(
-        self, left: XPathExpr, right: XPathExpr
-    ) -> XPathExpr:
-        """right is a sibling immediately after left; select left"""
-        right.add_name_test()
-        right.add_condition("position() = 1")
-        return left.add_condition(f"following-sibling::{right}")
-
-    def xpath_relation_indirect_adjacent_combinator(
-        self, left: XPathExpr, right: XPathExpr
-    ) -> XPathExpr:
-        """right is a sibling after left, immediately or not; select left"""
-        return left.add_condition(f"following-sibling::{right}")
 
     # Function: dispatch by function/pseudo-class name
 
