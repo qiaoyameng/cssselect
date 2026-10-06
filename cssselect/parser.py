@@ -16,7 +16,16 @@ from __future__ import annotations
 import operator
 import re
 import sys
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, Union, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Protocol,
+    TypeAlias,
+    Union,
+    cast,
+    overload,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
@@ -58,6 +67,7 @@ Tree: TypeAlias = Union[
     "Matching",
     "SpecificityAdjustment",
     "CombinedSelector",
+    "Nesting",
 ]
 PseudoElement: TypeAlias = Union["FunctionalPseudoElement", str]
 
@@ -509,6 +519,19 @@ class CombinedSelector:
         return a1 + a2, b1 + b2, c1 + c2
 
 
+class Nesting:
+    """Represents the CSS nesting selector (``&``)."""
+
+    def __repr__(self) -> str:
+        return "Nesting[&]"
+
+    def canonical(self) -> str:
+        return "&"
+
+    def specificity(self) -> tuple[int, int, int]:
+        return 0, 0, 0
+
+
 #### Parser
 
 # foo
@@ -556,6 +579,242 @@ def parse(css: str) -> list[Selector]:
     return list(parse_selector_group(stream))
 
 
+def parse_nesting(
+    parent: str | Selector | Iterable[str | Selector],
+    nested: str | None = None,
+) -> list[Selector]:
+    """Parse and expand a CSS nesting selector.
+
+    *parent* is the parent selector list. It can be a CSS string, a parsed
+    selector, or an iterable of either. *nested* is a relative selector list
+    containing one or more nesting selectors.
+    """
+    parents = _as_parent_selectors(parent)
+    if nested is None:
+        return parents
+
+    parent_trees = []
+    for parent_selector in parents:
+        if parent_selector.pseudo_element:
+            raise SelectorSyntaxError(
+                "Pseudo-elements are not supported in a parent selector list"
+            )
+        parent_trees.append(parent_selector.parsed_tree)
+
+    replacement: Tree
+    if len(parent_trees) == 1:
+        replacement = parent_trees[0]
+    else:
+        replacement = Matching(
+            Element(), [_clone_tree(tree) for tree in parent_trees]
+        )
+
+    results = []
+    for tokens in _split_nested_selector_list(nested):
+        stream = TokenStream(tokens)
+        stream.source = nested
+        tree, pseudo_element = parse_selector(stream, allow_nesting=True)
+        if stream.peek().type != "EOF":
+            raise SelectorSyntaxError(
+                f"Expected selector, got {stream.peek()}"
+            )
+        results.append(
+            Selector(
+                _expand_nesting_tree(tree, replacement),
+                pseudo_element=pseudo_element,
+            )
+        )
+    return results
+
+
+def parse_nested_selector(
+    parent: str | Selector | Iterable[str | Selector],
+    nested: str | None = None,
+) -> list[Selector]:
+    return parse_nesting(parent, nested)
+
+
+def _as_parent_selectors(
+    parent: str | Selector | Iterable[str | Selector],
+) -> list[Selector]:
+    if isinstance(parent, str):
+        return parse(parent)
+    if isinstance(parent, Selector):
+        return [parent]
+    selectors = []
+    for item in parent:
+        if isinstance(item, str):
+            selectors.extend(parse(item))
+        else:
+            selectors.append(item)
+    if not selectors:
+        raise SelectorSyntaxError("Got an empty parent selector list")
+    return selectors
+
+
+def _split_nested_selector_list(css: str) -> list[list[Token]]:
+    groups: list[list[Token]] = []
+    current: list[Token] = []
+    depth = 0
+    has_nesting = False
+
+    for token in tokenize(css):
+        if token == ("DELIM", ",") and depth == 0:
+            groups.append(_prepare_nested_tokens(current, has_nesting))
+            current = []
+            has_nesting = False
+        elif token.type != "EOF":
+            current.append(token)
+
+        if token == ("DELIM", "(") or token == ("DELIM", "["):
+            depth += 1
+        elif token == ("DELIM", ")") or token == ("DELIM", "]"):
+            depth -= 1
+            if depth < 0:
+                raise SelectorSyntaxError(f"Unexpected '{token.value}'")
+        elif token.type == "NESTING":
+            has_nesting = True
+
+    if depth:
+        raise SelectorSyntaxError("Got an unclosed function or attribute selector")
+    groups.append(_prepare_nested_tokens(current, has_nesting))
+    return groups
+
+
+def _prepare_nested_tokens(tokens: list[Token], has_nesting: bool) -> list[Token]:
+    first = 0
+    while first < len(tokens) and tokens[first].type == "S":
+        first += 1
+    if first == len(tokens):
+        return [*tokens, EOFToken(0)]
+
+    prepared = tokens[first:]
+    if not has_nesting:
+        prepared = [
+            Token("NESTING", "&", 0),
+            Token("S", " ", 1),
+            *prepared,
+        ]
+    return [*prepared, EOFToken(prepared[-1].pos + 1)]
+
+
+def _expand_nesting_tree(tree: Tree, replacement: Tree) -> Tree:
+    if isinstance(tree, Nesting):
+        return _clone_tree(replacement)
+
+    if isinstance(tree, CombinedSelector):
+        return CombinedSelector(
+            _expand_nesting_tree(tree.selector, replacement),
+            tree.combinator,
+            _expand_nesting_tree(tree.subselector, replacement),
+        )
+    if isinstance(tree, Negation):
+        return Negation(
+            _expand_nesting_tree(tree.selector, replacement),
+            _expand_nesting_tree(tree.subselector, replacement),
+        )
+    if isinstance(tree, Matching):
+        return Matching(
+            _expand_nesting_tree(tree.selector, replacement),
+            [
+                _expand_nesting_tree(selector, replacement)
+                for selector in tree.selector_list
+            ],
+        )
+    if isinstance(tree, SpecificityAdjustment):
+        return SpecificityAdjustment(
+            _expand_nesting_tree(tree.selector, replacement),
+            [
+                _expand_nesting_tree(selector, replacement)
+                for selector in tree.selector_list
+            ],
+        )
+    if isinstance(tree, Relation):
+        subselector = Selector(
+            _expand_nesting_tree(tree.subselector.parsed_tree, replacement),
+            tree.subselector.pseudo_element,
+        )
+        return Relation(
+            _expand_nesting_tree(tree.selector, replacement),
+            tree.combinator,
+            subselector,
+        )
+    if isinstance(tree, Element):
+        return tree
+    selector_tree = _expand_nesting_tree(cast("Any", tree).selector, replacement)
+    return _clone_tree_with_selector(tree, selector_tree)
+
+
+def _clone_tree_with_selector(tree: Tree, selector: Tree) -> Tree:
+    if isinstance(tree, Class):
+        return Class(selector, tree.class_name)
+    if isinstance(tree, Function):
+        return Function(selector, tree.name, tree.arguments)
+    if isinstance(tree, Pseudo):
+        return Pseudo(selector, tree.ident)
+    if isinstance(tree, Attrib):
+        return Attrib(
+            selector,
+            tree.namespace,
+            tree.attrib,
+            tree.operator,
+            tree.value,
+            tree.flag,
+        )
+    if isinstance(tree, Hash):
+        return Hash(selector, tree.id)
+    raise SelectorSyntaxError(f"Unsupported nesting selector tree: {tree!r}")
+
+
+def _clone_tree(tree: Tree) -> Tree:
+    if isinstance(tree, (Element, Nesting)):
+        return tree
+    if isinstance(tree, CombinedSelector):
+        return CombinedSelector(
+            _clone_tree(tree.selector),
+            tree.combinator,
+            _clone_tree(tree.subselector),
+        )
+    if isinstance(tree, Negation):
+        return Negation(
+            _clone_tree(tree.selector), _clone_tree(tree.subselector)
+        )
+    if isinstance(tree, Matching):
+        return Matching(
+            _clone_tree(tree.selector),
+            [_clone_tree(selector) for selector in tree.selector_list],
+        )
+    if isinstance(tree, SpecificityAdjustment):
+        return SpecificityAdjustment(
+            _clone_tree(tree.selector),
+            [_clone_tree(selector) for selector in tree.selector_list],
+        )
+    if isinstance(tree, Relation):
+        subselector = Selector(
+            _clone_tree(tree.subselector.parsed_tree),
+            tree.subselector.pseudo_element,
+        )
+        return Relation(_clone_tree(tree.selector), tree.combinator, subselector)
+    if isinstance(tree, Class):
+        return Class(_clone_tree(tree.selector), tree.class_name)
+    if isinstance(tree, Function):
+        return Function(_clone_tree(tree.selector), tree.name, tree.arguments)
+    if isinstance(tree, Pseudo):
+        return Pseudo(_clone_tree(tree.selector), tree.ident)
+    if isinstance(tree, Attrib):
+        return Attrib(
+            _clone_tree(tree.selector),
+            tree.namespace,
+            tree.attrib,
+            tree.operator,
+            tree.value,
+            tree.flag,
+        )
+    if isinstance(tree, Hash):
+        return Hash(_clone_tree(tree.selector), tree.id)
+    raise SelectorSyntaxError(f"Unsupported selector tree: {tree!r}")
+
+
 #    except SelectorSyntaxError:
 #        e = sys.exc_info()[1]
 #        message = "%s at %s -> %r" % (
@@ -576,12 +835,28 @@ def parse_selector_group(stream: TokenStream) -> Iterator[Selector]:
             break
 
 
-def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
-    result, pseudo_element = parse_simple_selector(stream)
+def parse_selector(
+    stream: TokenStream,
+    inside_negation: bool = False,
+    inside_selector_list: bool = False,
+    stop_at_parenthesis: bool = False,
+    allow_nesting: bool = False,
+    allow_negation: bool = False,
+) -> tuple[Tree, PseudoElement | None]:
+    result, pseudo_element = parse_simple_selector(
+        stream,
+        inside_negation=inside_negation,
+        inside_selector_list=inside_selector_list,
+        stop_at_parenthesis=stop_at_parenthesis,
+        allow_nesting=allow_nesting,
+        allow_negation=allow_negation,
+    )
     while 1:
         stream.skip_whitespace()
         peek = stream.peek()
-        if peek in (("EOF", None), ("DELIM", ",")):
+        if peek in (("EOF", None), ("DELIM", ",")) or (
+            stop_at_parenthesis and peek == ("DELIM", ")")
+        ):
             break
         if pseudo_element:
             raise SelectorSyntaxError(
@@ -595,7 +870,14 @@ def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
             # By exclusion, the last parse_simple_selector() ended
             # at peek == ' '
             combinator = " "
-        next_selector, pseudo_element = parse_simple_selector(stream)
+        next_selector, pseudo_element = parse_simple_selector(
+            stream,
+            inside_negation=inside_negation,
+            inside_selector_list=inside_selector_list,
+            stop_at_parenthesis=stop_at_parenthesis,
+            allow_nesting=allow_nesting,
+            allow_negation=allow_negation,
+        )
         result = CombinedSelector(result, combinator, next_selector)
     return result, pseudo_element
 
@@ -604,11 +886,26 @@ def parse_simple_selector(
     stream: TokenStream,
     inside_negation: bool = False,
     inside_selector_list: bool = False,
+    stop_at_parenthesis: bool = False,
+    allow_nesting: bool = False,
+    allow_negation: bool = False,
 ) -> tuple[Tree, PseudoElement | None]:
     stream.skip_whitespace()
     selector_start = len(stream.used)
     peek = stream.peek()
-    if peek.type == "IDENT" or peek == ("DELIM", "*"):
+    if peek.type == "NESTING":
+        if not allow_nesting:
+            raise SelectorSyntaxError(
+                "Got nesting selector '&' outside of a nested selector"
+            )
+        stream.next()
+        next_peek = stream.peek()
+        if next_peek.type == "IDENT" or next_peek == ("DELIM", "*"):
+            raise SelectorSyntaxError(
+                f"Got type selector after nesting selector '&': {next_peek}"
+            )
+        result: Tree = Nesting()
+    elif peek.type == "IDENT" or peek == ("DELIM", "*"):
         if peek.type == "IDENT":
             namespace = stream.next().value
         else:
@@ -622,14 +919,15 @@ def parse_simple_selector(
             namespace = None
     else:
         element = namespace = None
-    result: Tree = Element(namespace, element)
+    if peek.type != "NESTING":
+        result = Element(namespace, element)
     pseudo_element: PseudoElement | None = None
     while 1:
         peek = stream.peek()
         if (
             peek.type in ("S", "EOF")
             or peek.is_delim(",", "+", ">", "~")
-            or (inside_negation and peek == ("DELIM", ")"))
+            or (stop_at_parenthesis and peek == ("DELIM", ")"))
         ):
             break
         if pseudo_element:
@@ -690,59 +988,87 @@ def parse_simple_selector(
             stream.next()
             stream.skip_whitespace()
             if ident.lower() == "not":
-                if inside_selector_list:
+                if inside_selector_list and not allow_negation:
                     raise SelectorSyntaxError(
                         ":not() is not supported inside :is(), :where() and :matches()"
                     )
-                if inside_negation:
+                if inside_negation and not (allow_negation and inside_selector_list):
                     raise SelectorSyntaxError("Got nested :not()")
-                argument, argument_pseudo_element = parse_simple_selector(
-                    stream, inside_negation=True
-                )
-                while 1:
-                    # Whitespace before the closing parenthesis is not a
-                    # descendant combinator.
-                    stream.skip_whitespace()
-                    peek = stream.peek()
-                    if argument_pseudo_element:
-                        raise SelectorSyntaxError(
-                            f"Got pseudo-element ::{argument_pseudo_element} inside :not() at {peek.pos}"
-                        )
-                    if peek == ("DELIM", ")"):
-                        stream.next()
-                        break
-                    if peek.is_delim("+", ">", "~"):
-                        argument_combinator = cast("str", stream.next().value)
-                        stream.skip_whitespace()
-                    elif peek.type == "EOF" or peek.is_delim(","):
-                        # A selector list is not supported in :not().
-                        raise SelectorSyntaxError(f"Expected ')', got {peek}")
+                stream.skip_whitespace()
+                if allow_nesting:
+                    arguments = parse_simple_selector_arguments(
+                        stream,
+                        allow_nesting=True,
+                        inside_selector_list=False,
+                    )
+                    argument: Tree
+                    if len(arguments) == 1:
+                        argument = arguments[0]
                     else:
-                        argument_combinator = " "
-                    next_selector, argument_pseudo_element = parse_simple_selector(
-                        stream, inside_negation=True
+                        argument = Matching(Element(), arguments)
+                else:
+                    argument, argument_pseudo_element = parse_selector(
+                        stream,
+                        inside_negation=True,
+                        stop_at_parenthesis=True,
                     )
-                    argument = CombinedSelector(
-                        argument, argument_combinator, next_selector
-                    )
+                    if argument_pseudo_element:
+                        position = stream.peek().pos
+                        raise SelectorSyntaxError(
+                            "Got pseudo-element "
+                            f"::{argument_pseudo_element} inside :not() at {position}"
+                        )
+                    stream.skip_whitespace()
+                    closing = stream.next()
+                    if closing != ("DELIM", ")"):
+                        raise SelectorSyntaxError(
+                            f"Expected ')', got {closing}"
+                        )
                 result = Negation(result, argument)
             elif ident.lower() == "has":
                 combinator, arguments = parse_relative_selector(stream)
                 result = Relation(result, combinator, arguments)
 
             elif ident.lower() in ("matches", "is"):
-                selectors = parse_simple_selector_arguments(stream)
+                selectors = parse_simple_selector_arguments(
+                    stream, allow_nesting=allow_nesting
+                )
                 result = Matching(result, selectors)
             elif ident.lower() == "where":
-                selectors = parse_simple_selector_arguments(stream)
+                selectors = parse_simple_selector_arguments(
+                    stream, allow_nesting=allow_nesting
+                )
                 result = SpecificityAdjustment(result, selectors)
             else:
                 result = Function(result, ident, parse_arguments(stream))
+        elif peek.type == "NESTING":
+            if not allow_nesting:
+                raise SelectorSyntaxError(
+                    "Got nesting selector '&' outside of a nested selector"
+                )
+            stream.next()
+            result = _add_nesting(result)
         else:
             raise SelectorSyntaxError(f"Expected selector, got {peek}")
     if len(stream.used) == selector_start:
         raise SelectorSyntaxError(f"Expected selector, got {stream.peek()}")
     return result, pseudo_element
+
+
+def _add_nesting(selector: Tree) -> Tree:
+    if isinstance(selector, Element):
+        if selector.element is None and selector.namespace is None:
+            return Nesting()
+        raise SelectorSyntaxError(
+            f"Got nesting selector '&' after type selector {selector.canonical()}"
+        )
+    if isinstance(selector, Nesting):
+        return Matching(selector, [Nesting()])
+    wrapper = cast("Any", selector)
+    if not hasattr(wrapper, "selector"):
+        raise SelectorSyntaxError("Got unexpected nesting selector '&'")
+    wrapper.selector = _add_nesting(wrapper.selector)
+    return selector
 
 
 def parse_arguments(stream: TokenStream) -> list[Token]:  # noqa: RET503
@@ -797,11 +1123,20 @@ def parse_relative_selector(stream: TokenStream) -> tuple[Token, Selector]:
     return combinator, Selector(result)
 
 
-def parse_simple_selector_arguments(stream: TokenStream) -> list[Tree]:
+def parse_simple_selector_arguments(
+    stream: TokenStream,
+    allow_nesting: bool = False,
+    inside_selector_list: bool = True,
+) -> list[Tree]:
     arguments = []
     while 1:
-        result, pseudo_element = parse_simple_selector(
-            stream, inside_negation=True, inside_selector_list=True
+        result, pseudo_element = parse_selector(
+            stream,
+            inside_negation=True,
+            inside_selector_list=inside_selector_list,
+            stop_at_parenthesis=True,
+            allow_nesting=allow_nesting,
+            allow_negation=allow_nesting,
         )
         if pseudo_element:
             raise SelectorSyntaxError(
@@ -906,7 +1241,7 @@ class Token(tuple[str, str | None]):  # noqa: SLOT001
     @overload
     def __new__(
         cls,
-        type_: Literal["IDENT", "HASH", "STRING", "S", "DELIM", "NUMBER"],
+        type_: Literal["IDENT", "HASH", "NESTING", "STRING", "S", "DELIM", "NUMBER"],
         value: str,
         pos: int,
     ) -> Self: ...
@@ -1100,6 +1435,11 @@ def tokenize(s: str) -> Iterator[Token]:
             value = match.group()
             yield Token("NUMBER", value, pos)
             pos = match.end()
+            continue
+
+        if s[pos] == "&":
+            yield Token("NESTING", "&", pos)
+            pos += 1
             continue
 
         pos2 = pos + 2

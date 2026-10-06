@@ -25,6 +25,7 @@ from cssselect.parser import (
     Function,
     Hash,
     Matching,
+    Nesting,
     Negation,
     Pseudo,
     PseudoElement,
@@ -366,23 +367,27 @@ class GenericTranslator:
             self.xpath(matching.selector), matching.selector_list
         )
 
+    def xpath_nesting(self, nesting: Nesting) -> XPathExpr:
+        raise ExpressionError("Unresolved nesting selector '&'")
+
     def _xpath_add_selector_list_condition(
         self, xpath: XPathExpr, selector_list: Iterable[Tree]
     ) -> XPathExpr:
         """Add a condition matching any selector of the list
         (for :is() and :where())."""
         condition = ""
-        for e in (self.xpath(selector) for selector in selector_list):
+        for selector_argument in selector_list:
+            e = self.xpath(selector_argument)
             if e.path:
-                # Only a combined selector (e.g. "a b") translates to a path,
-                # which cannot be embedded into a predicate of the outer
-                # expression. The parser rejects combinators in these arguments,
-                # so this is only reachable through a hand-built Matching or
-                # SpecificityAdjustment node.
-                raise ExpressionError(
-                    "Combined selectors are not supported inside "
-                    ":is(), :where() and :matches()"
+                match_condition = self._xpath_match_condition(selector_argument)
+                if match_condition is None:
+                    return xpath
+                condition = (
+                    f"({condition}) or ({match_condition})"
+                    if condition
+                    else f"({match_condition})"
                 )
+                continue
             e.add_name_test()
             if not e.condition:
                 # This argument matches any element, so the whole selector

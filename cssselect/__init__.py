@@ -16,6 +16,8 @@ from cssselect.parser import (
     SelectorError,
     SelectorSyntaxError,
     parse,
+    parse_nested_selector,
+    parse_nesting,
 )
 from cssselect.xpath import ExpressionError, GenericTranslator, HTMLTranslator
 
@@ -28,6 +30,8 @@ __all__ = (
     "SelectorError",
     "SelectorSyntaxError",
     "parse",
+    "parse_nested_selector",
+    "parse_nesting",
 )
 
 VERSION = "1.5.0"

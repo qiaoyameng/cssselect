@@ -51,6 +51,7 @@ is a group of two selectors.
 .. _group of selectors: http://www.w3.org/TR/selectors/#grouping
 
 .. autofunction:: parse
+.. autofunction:: parse_nesting
 .. autoclass:: Selector()
     :members:
 
@@ -108,11 +109,15 @@ be implemented):
 
 * The ``:scope`` pseudo-class. Limitation: it can only be used at a start of a
   selector.
-* The ``:is()`` and ``:where()`` pseudo-classes. Limitation: their arguments
-  are a comma-separated list of *compound selectors*; combinators are not
-  allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope`` are
-  also rejected inside them, while ``:has()`` is supported (e.g.
-  ``:is(:has(> a))``).
+* The ``:is()`` and ``:where()`` pseudo-classes. Their arguments may be a
+  comma-separated list of complex selectors, e.g. ``:is(a b, c > d)``.
+  ``:scope`` is rejected inside them. ``:not()`` is supported when expanding
+  CSS nesting, and ``:has()`` is supported (e.g. ``:is(:has(> a))``).
+* CSS nesting through :func:`parse_nesting`. Parent selector lists use the
+  maximum parent specificity without producing a Cartesian product with
+  different per-branch weights. Selectors that contain unresolved ``&`` or
+  features without an XPath 1.0 representation are rejected during XPath
+  translation.
 * The ``:has()`` pseudo-class. Limitation: it takes a single argument, made of
   an optional leading combinator (``>``, ``+`` or ``~``) followed by one
   *compound selector* built only from type, class and universal selectors

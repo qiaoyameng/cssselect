@@ -31,11 +31,11 @@ from cssselect import (
     HTMLTranslator,
     SelectorSyntaxError,
     parse,
+    parse_nesting,
 )
 from cssselect.parser import (
     Function,
     FunctionalPseudoElement,
-    Matching,
     PseudoElement,
     Token,
     parse_series,
@@ -391,6 +391,96 @@ class TestCssselect(unittest.TestCase):
             3,
         )
 
+    def test_nesting_expansion(self) -> None:
+        def canonical(css: str, parent: str = ".a, #b") -> list[str]:
+            return [selector.canonical() for selector in parse_nesting(parent, css)]
+
+        assert canonical("&.d") == [":is(.a, #b).d"]
+        assert canonical(".d") == [":is(.a, #b) .d"]
+        assert canonical("> .d") == [":is(.a, #b) > .d"]
+        assert canonical("&.d, .e") == [":is(.a, #b).d", ":is(.a, #b) .e"]
+        assert canonical("&&", parent=".a") == [".a:is(.a)"]
+        assert canonical("&.d, &&", parent=".a") == [".a.d", ".a:is(.a)"]
+        assert canonical(":is(&.d, .e)") == [
+            ":is(:is(.a, #b).d, .e)"
+        ]
+        assert canonical(":not(&.d)") == [":not(:is(.a, #b).d)"]
+        assert canonical(":not(&.d, .e)") == [
+            ":not(:is(:is(.a, #b).d, .e))"
+        ]
+        assert canonical(":is(:not(&))") == [":is(:not(:is(.a, #b)))"]
+        assert canonical('[title="&"]') == [":is(.a, #b) [title='&']"]
+        assert canonical(r"\&") == [":is(.a, #b) \\&"]
+
+        selector = parse_nesting(".a, #b", "&.d")[0]
+        assert selector.specificity() == (1, 1, 0)
+
+        implicit_selector = parse_nesting(".a, #b", ".d")[0]
+        assert implicit_selector.specificity() == (1, 1, 0)
+
+        repeated_selector = parse_nesting(".a, #b", "&&")[0]
+        assert repeated_selector.specificity() == (2, 0, 0)
+
+        assert [token.type for token in tokenize('[title="&"]')] == [
+            "DELIM",
+            "IDENT",
+            "DELIM",
+            "STRING",
+            "DELIM",
+            "EOF",
+        ]
+        assert [token.type for token in tokenize(r"\&")] == ["IDENT", "EOF"]
+        assert [token.type for token in tokenize("&")] == ["NESTING", "EOF"]
+
+        with pytest.raises(SelectorSyntaxError):
+            parse("&")
+        with pytest.raises(SelectorSyntaxError):
+            parse(":not(a, b)")
+        with pytest.raises(SelectorSyntaxError):
+            parse(":is(:not(a))")
+        with pytest.raises(SelectorSyntaxError):
+            parse_nesting(".a", "&div")
+        with pytest.raises(SelectorSyntaxError):
+            parse_nesting(".a", "&*")
+
+    def test_nesting_xpath(self) -> None:
+        document = etree.fromstring(
+            """
+            <root>
+                <span class="a"><i class="c" id="from-class">x</i></span>
+                <b id="b"><i class="c" id="from-id">x</i></b>
+                <i class="c" id="outside">x</i>
+            </root>
+            """
+        )
+        translator = GenericTranslator()
+        nested = parse_nesting(".a, #b", "& .c")[0]
+        assert nested.specificity() == (1, 1, 0)
+        xpath_expression = translator.selector_to_xpath(nested, prefix="")
+        expected = parse(":is(.a, #b) .c")[0]
+        expected_expression = translator.selector_to_xpath(expected, prefix="")
+
+        nested_ids = {
+            element.get("id")
+            for element in typing.cast(
+                "list[etree._Element]", document.xpath(xpath_expression)
+            )
+        }
+        expected_ids = {
+            element.get("id")
+            for element in typing.cast(
+                "list[etree._Element]", document.xpath(expected_expression)
+            )
+        }
+        assert nested_ids == {"from-class", "from-id"}
+        assert nested_ids == expected_ids
+
+        pseudo_element_selector = parse_nesting("a", "&::before")[0]
+        with pytest.raises(ExpressionError):
+            translator.selector_to_xpath(
+                pseudo_element_selector, translate_pseudo_elements=True
+            )
+
     def test_css_export(self) -> None:
         def css2css(css: str, res: str | None = None) -> None:
             selectors = parse(css)
@@ -590,13 +680,11 @@ class TestCssselect(unittest.TestCase):
         assert get_error(":is(:before)") == (
             "Got pseudo-element ::before inside function"
         )
-        assert get_error(":is(a b)") == ("Expected an argument, got <IDENT 'b' at 6>")
+        assert get_error(":is(a b)") is None
         assert get_error(":where(:before)") == (
             "Got pseudo-element ::before inside function"
         )
-        assert get_error(":where(a b)") == (
-            "Expected an argument, got <IDENT 'b' at 9>"
-        )
+        assert get_error(":where(a b)") is None
         assert get_error(":is(a") == ("Expected an argument, got <EOF at 5>")
         assert get_error(":is(a,") == ("Expected selector, got <EOF at 6>")
         assert get_error(":is(a,)") == ("Expected selector, got <DELIM ')' at 6>")
@@ -995,18 +1083,9 @@ class TestCssselect(unittest.TestCase):
 
         assert LowerValues().css_to_xpath("[Foo=BAR]", prefix="") == "*[@Foo = 'bar']"
 
-        # A member of an :is()/:where() selector list that translates to a
-        # path (rather than a predicate) cannot be embedded in the outer
-        # predicate and is rejected. The parser does not currently produce
-        # such an argument, so build the Matching node directly.
-        base = parse("x")[0].parsed_tree
-        combined = parse("a b")[0].parsed_tree
-        matching = Matching(base, [combined])
-        with pytest.raises(
-            ExpressionError,
-            match=r"not supported inside :is\(\), :where\(\) and :matches\(\)",
-        ):
-            GenericTranslator().xpath(matching)
+        assert GenericTranslator().css_to_xpath(":is(a b)", prefix="") == (
+            "*[(self::b and ancestor::*[self::a])]"
+        )
 
     def test_add_name_test(self) -> None:
         # Directly exercise XPathExpr.add_name_test(), part of the
