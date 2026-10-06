@@ -523,7 +523,7 @@ _class_re = re.compile(
 )
 
 
-def parse(css: str) -> list[Selector]:
+def parse(css: str, allow_scope_anywhere: bool = False) -> list[Selector]:
     """Parse a CSS *group of selectors*.
 
     If you don't care about pseudo-elements or selector specificity,
@@ -531,6 +531,14 @@ def parse(css: str) -> list[Selector]:
 
     :param css:
         A *group of selectors* as a string.
+    :param allow_scope_anywhere:
+        Accept the ``:scope`` pseudo-class in any compound selector
+        (after combinators and inside ``:is()``/``:where()``/``:matches()``
+        arguments), not just at the start of a selector.
+        This is meant for translations that bind ``:scope`` to an explicit
+        node, such as :meth:`~GenericTranslator.css_to_xpath_with_scope`;
+        the default translation only supports ``:scope`` at the start
+        of a selector.
     :raises:
         :class:`SelectorSyntaxError` on invalid selectors.
     :returns:
@@ -553,6 +561,7 @@ def parse(css: str) -> list[Selector]:
 
     stream = TokenStream(tokenize(css))
     stream.source = css
+    stream.allow_scope_anywhere = allow_scope_anywhere
     return list(parse_selector_group(stream))
 
 
@@ -671,21 +680,30 @@ def parse_simple_selector(
             if stream.peek() != ("DELIM", "("):
                 result = Pseudo(result, ident)
                 if result.ident == "scope":
-                    # :scope is only supported at the start of a selector,
-                    # i.e. never in :is()/:where()/:matches() arguments
-                    # (where a preceding comma separates arguments, not
-                    # selectors), and otherwise only when the tokens
-                    # preceding its compound selector are the start of the
-                    # input or a comma.
-                    preceding = stream.used[:selector_start]
-                    while preceding and preceding[-1].type == "S":
-                        preceding = preceding[:-1]
-                    if inside_selector_list or (
-                        preceding and not preceding[-1].is_delim(",")
-                    ):
-                        raise SelectorSyntaxError(
-                            'Got pseudo-class ":scope" not at the start of a selector'
-                        )
+                    if stream.allow_scope_anywhere:
+                        # With an explicitly bound scope node, :scope is
+                        # supported in any compound selector, except in
+                        # :not() arguments.
+                        if inside_negation and not inside_selector_list:
+                            raise SelectorSyntaxError(
+                                'Got pseudo-class ":scope" inside :not()'
+                            )
+                    else:
+                        # :scope is only supported at the start of a selector,
+                        # i.e. never in :is()/:where()/:matches() arguments
+                        # (where a preceding comma separates arguments, not
+                        # selectors), and otherwise only when the tokens
+                        # preceding its compound selector are the start of the
+                        # input or a comma.
+                        preceding = stream.used[:selector_start]
+                        while preceding and preceding[-1].type == "S":
+                            preceding = preceding[:-1]
+                        if inside_selector_list or (
+                            preceding and not preceding[-1].is_delim(",")
+                        ):
+                            raise SelectorSyntaxError(
+                                'Got pseudo-class ":scope" not at the start of a selector'
+                            )
                 continue
             stream.next()
             stream.skip_whitespace()
@@ -1123,6 +1141,7 @@ class TokenStream:
         self.used: list[Token] = []
         self.tokens = iter(tokens)
         self.source = source
+        self.allow_scope_anywhere = False
         self.peeked: Token | None = None
         self._peeking = False
         self.next_token = self.tokens.__next__

@@ -57,7 +57,7 @@ is a group of two selectors.
 .. autoclass:: FunctionalPseudoElement
 
 .. autoclass:: GenericTranslator
-    :members: css_to_xpath, selector_to_xpath
+    :members: css_to_xpath, css_to_xpath_with_scope, selector_to_xpath
 
 .. autoclass:: HTMLTranslator
 
@@ -106,13 +106,19 @@ of the Level 4 additions is not applicable to cssselect similarly to ``:hover``
 or not representable in XPath 1.0 so the complete specification is unlikely to
 be implemented):
 
-* The ``:scope`` pseudo-class. Limitation: it can only be used at a start of a
-  selector.
+* The ``:scope`` pseudo-class. Limitation: with
+  :meth:`~cssselect.GenericTranslator.css_to_xpath` it can only be used at a
+  start of a selector. Use
+  :meth:`~cssselect.GenericTranslator.css_to_xpath_with_scope` to bind
+  ``:scope`` to an explicit node by identity; it is then accepted in any
+  compound selector (after combinators and inside ``:is()``/``:where()``
+  arguments), and the translated expression can be evaluated with any
+  context node.
 * The ``:is()`` and ``:where()`` pseudo-classes. Limitation: their arguments
   are a comma-separated list of *compound selectors*; combinators are not
-  allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope`` are
-  also rejected inside them, while ``:has()`` is supported (e.g.
-  ``:is(:has(> a))``).
+  allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope``
+  are also rejected inside them (the latter only without an explicit scope,
+  see above), while ``:has()`` is supported (e.g. ``:is(:has(> a))``).
 * The ``:has()`` pseudo-class. Limitation: it takes a single argument, made of
   an optional leading combinator (``>``, ``+`` or ``~``) followed by one
   *compound selector* built only from type, class and universal selectors

@@ -1671,6 +1671,152 @@ class TestCssselect(unittest.TestCase):
         # :not(f) must not exclude it.
         assert pcss("*:not(f)") == ["nil", "x", "dns-f"]
 
+    def test_select_with_scope(self) -> None:
+        # Two structurally identical subtrees, down to repeated id
+        # attributes: the scope binding must rely on node identity,
+        # not on any attribute value.
+        document = etree.XML("""
+<root>
+  <section id="dup" class="group">
+    <item id="dup" class="a">first</item>
+    <item id="dup" class="b"/>
+    <tail/>
+  </section>
+  <section id="dup" class="group">
+    <item id="dup" class="a">second</item>
+    <item id="dup" class="b"/>
+    <tail/>
+  </section>
+</root>""")
+        translator = GenericTranslator()
+        first, second = document
+
+        def scoped(selector: str, scope: etree._Element) -> list[etree._Element]:
+            xpath, variables = translator.css_to_xpath_with_scope(selector, scope=scope)
+            return typing.cast(
+                "list[etree._Element]", document.xpath(xpath, **variables)
+            )
+
+        def reference(selector: str, scope: etree._Element) -> list[etree._Element]:
+            # Reference selection: the plain translation, evaluated
+            # from the scope node itself.
+            return typing.cast(
+                "list[etree._Element]", scope.xpath(translator.css_to_xpath(selector))
+            )
+
+        # :scope alone selects exactly the bound node,
+        # even when evaluating from the document root.
+        assert scoped(":scope", first) == [first]
+        assert scoped(":scope", second) == [second]
+
+        # Results agree with the reference selection from the scope node...
+        for section in (first, second):
+            assert scoped(":scope > item", section) == reference(
+                ":scope > item", section
+            )
+            assert scoped(":scope > item.b", section) == reference(
+                ":scope > item.b", section
+            )
+            assert scoped(":scope item", section) == reference(":scope item", section)
+        # ... and the two bindings stay disjoint despite the identical
+        # structure and repeated id attributes.
+        first_items = scoped(":scope > item", first)
+        second_items = scoped(":scope > item", second)
+        assert first_items and second_items
+        assert not set(first_items) & set(second_items)
+        assert set(first_items) == set(first[:2])
+        assert set(second_items) == set(second[:2])
+
+        # :scope after combinators
+        assert scoped("section > .b:scope", second[1]) == [second[1]]
+        assert scoped("section > .b:scope", first[1]) == [first[1]]
+
+        # :scope is not a sandbox: relations to nodes outside of the
+        # scope node's subtree keep their usual meaning.
+        assert scoped(":scope + item", second[0]) == [second[1]]
+        assert scoped(":scope ~ tail", first[0]) == [first[2]]
+        assert scoped("root :scope", second[0]) == [second[0]]
+        assert scoped("section :scope", first[2]) == [first[2]]
+
+        # :scope in :is()/:where() branches
+        assert scoped(":where(:scope) > item", second) == list(second[:2])
+        assert scoped(":is(:scope, tail)", first[0]) == [first[0], first[2], second[2]]
+        assert scoped(":is(item.a, :scope)", second[1]) == [
+            first[0],
+            second[0],
+            second[1],
+        ]
+
+        # A selector without :scope needs no binding.
+        xpath, variables = translator.css_to_xpath_with_scope("item.b", scope=first)
+        assert variables == {}
+        assert xpath == translator.css_to_xpath("item.b")
+
+        # Using :scope without a scope node to bind is an error.
+        with pytest.raises(ExpressionError):
+            translator.css_to_xpath_with_scope(":scope > item")
+
+        # :scope is still rejected in :not() arguments.
+        with pytest.raises(SelectorSyntaxError):
+            translator.css_to_xpath_with_scope(":not(:scope)", scope=first)
+
+        # The plain translation interface is unchanged: it returns a
+        # string and keeps rejecting :scope away from the selector start.
+        assert isinstance(translator.css_to_xpath(":scope > item"), str)
+        with pytest.raises(SelectorSyntaxError):
+            translator.css_to_xpath("div :scope")
+
+    def test_select_with_scope_and_namespace(self) -> None:
+        # Scope binding cooperates with namespace prefixes: the type
+        # tests and the identity condition share the same expression.
+        document = etree.XML(
+            '<r xmlns:n="urn:x">'
+            '<w><n:item id="i"/><n:item id="i"/></w>'
+            '<w><n:item id="i"/><n:item id="i"/></w>'
+            "</r>"
+        )
+        translator = GenericTranslator()
+        first, second = document
+
+        def scoped(selector: str, scope: etree._Element) -> list[etree._Element]:
+            xpath, variables = translator.css_to_xpath_with_scope(selector, scope=scope)
+            return typing.cast(
+                "list[etree._Element]",
+                document.xpath(xpath, namespaces={"ns": "urn:x"}, **variables),
+            )
+
+        assert scoped(":scope > ns|item", first) == list(first)
+        assert scoped(":scope > ns|item", second) == list(second)
+        assert scoped("ns|item:scope", second[0]) == [second[0]]
+        assert scoped(":is(ns|item:scope)", first[1]) == [first[1]]
+
+    def test_parse_scope_anywhere(self) -> None:
+        def parse_one(css: str) -> str:
+            (selector,) = parse(css, allow_scope_anywhere=True)
+            assert selector.pseudo_element is None
+            return repr(selector.parsed_tree)
+
+        assert parse_one("div :scope") == (
+            "CombinedSelector[Element[div] <followed> Pseudo[Element[*]:scope]]"
+        )
+        assert parse_one("a > .foo:scope") == (
+            "CombinedSelector[Element[a] > Pseudo[Class[Element[*].foo]:scope]]"
+        )
+        assert parse_one(":is(:scope)") == (
+            "Matching[Element[*]:is(Pseudo[Element[*]:scope])]"
+        )
+        assert parse_one(":where(a, :scope)") == (
+            "SpecificityAdjustment[Element[*]:where(Element[a], Pseudo[Element[*]:scope])]"
+        )
+        # Still rejected in :not() arguments.
+        with pytest.raises(SelectorSyntaxError):
+            parse(":not(:scope)", allow_scope_anywhere=True)
+        # ... and the default grammar is unchanged.
+        with pytest.raises(SelectorSyntaxError):
+            parse("div :scope")
+        with pytest.raises(SelectorSyntaxError):
+            parse(":is(:scope)")
+
     def test_select_shakespeare(self) -> None:
         document = html.document_fromstring(HTML_SHAKESPEARE)
         body = typing.cast("list[etree._Element]", document.xpath("//body"))[0]

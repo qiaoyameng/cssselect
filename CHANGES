@@ -1,6 +1,19 @@
 Changelog
 =========
 
+Version 1.6.0
+-------------
+
+Unreleased.
+
+*   Added the ``GenericTranslator.css_to_xpath_with_scope()`` method, which
+    translates a group of selectors while binding the ``:scope``
+    pseudo-class to an explicit node, compared by node identity through an
+    XPath variable. The resulting expression can be evaluated with any
+    context node (e.g. the document root), and ``:scope`` is accepted in
+    any compound selector (after combinators and inside
+    ``:is()``/``:where()``/``:matches()`` arguments) for such translations.
+
 Version 1.5.0
 -------------
 
