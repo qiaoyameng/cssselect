@@ -371,27 +371,43 @@ class GenericTranslator:
     ) -> XPathExpr:
         """Add a condition matching any selector of the list
         (for :is() and :where())."""
-        condition = ""
-        for e in (self.xpath(selector) for selector in selector_list):
-            if e.path:
-                # Only a combined selector (e.g. "a b") translates to a path,
-                # which cannot be embedded into a predicate of the outer
-                # expression. The parser rejects combinators in these arguments,
-                # so this is only reachable through a hand-built Matching or
-                # SpecificityAdjustment node.
-                raise ExpressionError(
-                    "Combined selectors are not supported inside "
-                    ":is(), :where() and :matches()"
-                )
-            e.add_name_test()
-            if not e.condition:
-                # This argument matches any element, so the whole selector
-                # list does too: it adds no condition.
-                return xpath
-            condition = (
-                f"({condition}) or ({e.condition})" if condition else e.condition
+        conditions = []
+        matches_any_element = False
+        for selector in selector_list:
+            self._check_selector_list_support(selector)
+            condition = self._xpath_match_condition(selector)
+            if condition is None:
+                # This argument matches any element, but inspect every branch
+                # first: an unsupported later branch must not be hidden by it.
+                matches_any_element = True
+            else:
+                conditions.append(condition)
+        if matches_any_element:
+            return xpath
+        if not conditions:
+            return xpath.add_condition("0")
+        if len(conditions) == 1:
+            condition = conditions[0]
+        else:
+            condition = " or ".join(f"({item})" for item in conditions)
+        return xpath.add_condition(condition, conjuction="and")
+
+    def _check_selector_list_support(self, selector: Tree) -> None:
+        if isinstance(selector, Pseudo) and selector.ident == "scope":
+            raise ExpressionError(
+                ':scope is not supported inside :is(), :where() and :matches()'
             )
-        return xpath.add_condition(condition)
+        subselectors: Iterable[Tree] = ()
+        if isinstance(selector, (Matching, SpecificityAdjustment)):
+            subselectors = [selector.selector, *selector.selector_list]
+        elif isinstance(selector, (CombinedSelector, Negation)):
+            subselectors = (selector.selector, selector.subselector)
+        elif isinstance(selector, Relation):
+            subselectors = (selector.selector, selector.subselector.parsed_tree)
+        elif isinstance(selector, (Class, Function, Pseudo, Hash, Attrib)):
+            subselectors = (selector.selector,)
+        for subselector in subselectors:
+            self._check_selector_list_support(subselector)
 
     def xpath_function(self, function: Function) -> XPathExpr:
         """Translate a functional pseudo-class."""

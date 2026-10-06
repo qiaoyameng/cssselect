@@ -30,6 +30,12 @@ def ascii_lower(string: str) -> str:
     return string.encode("utf8").lower().decode("utf8")
 
 
+def _strip_universal_prefix(selector: str) -> str:
+    if len(selector) > 1 and selector[0] == "*" and selector[1] in "#.[:":
+        return selector[1:]
+    return selector
+
+
 class SelectorError(Exception):
     """Common parent for :class:`SelectorSyntaxError` and
     :class:`ExpressionError`.
@@ -119,10 +125,7 @@ class Selector:
         else:
             pseudo_element = ""
         res = f"{self.parsed_tree.canonical()}{pseudo_element}"
-        # Strip a redundant universal selector from e.g. "*.foo" (but not
-        # from e.g. "* > foo").
-        if len(res) > 1 and res[0] == "*" and res[1] in "#.[:":
-            res = res[1:]
+        res = _strip_universal_prefix(res)
         return res
 
     def specificity(self) -> tuple[int, int, int]:
@@ -254,10 +257,7 @@ class Negation:
 
     def canonical(self) -> str:
         subsel = self.subselector.canonical()
-        # Strip a redundant universal selector from e.g. "*.foo" (but not
-        # from e.g. "* > foo").
-        if len(subsel) > 1 and subsel[0] == "*" and subsel[1] in "#.[:":
-            subsel = subsel[1:]
+        subsel = _strip_universal_prefix(subsel)
         return f"{self.selector.canonical()}:not({subsel})"
 
     def specificity(self) -> tuple[int, int, int]:
@@ -289,9 +289,7 @@ class Relation:
         )
 
     def canonical(self) -> str:
-        subsel = self.subselector.canonical()
-        if len(subsel) > 1:
-            subsel = subsel.lstrip("*")
+        subsel = _strip_universal_prefix(self.subselector.canonical())
         return f"{self.selector.canonical()}:has({self._combinator_prefix()}{subsel})"
 
     def specificity(self) -> tuple[int, int, int]:
@@ -316,15 +314,14 @@ class Matching:
     def canonical(self) -> str:
         selector_arguments = []
         for s in self.selector_list:
-            selarg = s.canonical()
-            if len(selarg) > 1:
-                selarg = selarg.lstrip("*")
-            selector_arguments.append(selarg)
+            selector_arguments.append(_strip_universal_prefix(s.canonical()))
         args_str = ", ".join(selector_arguments)
         return f"{self.selector.canonical()}:is({args_str})"
 
     def specificity(self) -> tuple[int, int, int]:
         a1, b1, c1 = self.selector.specificity()
+        if not self.selector_list:
+            return a1, b1, c1
         a2, b2, c2 = max(x.specificity() for x in self.selector_list)
         return a1 + a2, b1 + b2, c1 + c2
 
@@ -346,10 +343,7 @@ class SpecificityAdjustment:
     def canonical(self) -> str:
         selector_arguments = []
         for s in self.selector_list:
-            selarg = s.canonical()
-            if len(selarg) > 1:
-                selarg = selarg.lstrip("*")
-            selector_arguments.append(selarg)
+            selector_arguments.append(_strip_universal_prefix(s.canonical()))
         args_str = ", ".join(selector_arguments)
         return f"{self.selector.canonical()}:where({args_str})"
 
@@ -497,9 +491,7 @@ class CombinedSelector:
         )
 
     def canonical(self) -> str:
-        subsel = self.subselector.canonical()
-        if len(subsel) > 1:
-            subsel = subsel.lstrip("*")
+        subsel = _strip_universal_prefix(self.subselector.canonical())
         combinator = " " if self.combinator == " " else f" {self.combinator} "
         return f"{self.selector.canonical()}{combinator}{subsel}"
 
@@ -576,8 +568,14 @@ def parse_selector_group(stream: TokenStream) -> Iterator[Selector]:
             break
 
 
-def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
-    result, pseudo_element = parse_simple_selector(stream)
+def parse_selector(
+    stream: TokenStream,
+    inside_forgiving_selector_list: bool = False,
+) -> tuple[Tree, PseudoElement | None]:
+    result, pseudo_element = parse_simple_selector(
+        stream,
+        inside_forgiving_selector_list=inside_forgiving_selector_list,
+    )
     while 1:
         stream.skip_whitespace()
         peek = stream.peek()
@@ -595,7 +593,10 @@ def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
             # By exclusion, the last parse_simple_selector() ended
             # at peek == ' '
             combinator = " "
-        next_selector, pseudo_element = parse_simple_selector(stream)
+        next_selector, pseudo_element = parse_simple_selector(
+            stream,
+            inside_forgiving_selector_list=inside_forgiving_selector_list,
+        )
         result = CombinedSelector(result, combinator, next_selector)
     return result, pseudo_element
 
@@ -603,7 +604,7 @@ def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
 def parse_simple_selector(
     stream: TokenStream,
     inside_negation: bool = False,
-    inside_selector_list: bool = False,
+    inside_forgiving_selector_list: bool = False,
 ) -> tuple[Tree, PseudoElement | None]:
     stream.skip_whitespace()
     selector_start = len(stream.used)
@@ -671,17 +672,15 @@ def parse_simple_selector(
             if stream.peek() != ("DELIM", "("):
                 result = Pseudo(result, ident)
                 if result.ident == "scope":
-                    # :scope is only supported at the start of a selector,
-                    # i.e. never in :is()/:where()/:matches() arguments
-                    # (where a preceding comma separates arguments, not
-                    # selectors), and otherwise only when the tokens
-                    # preceding its compound selector are the start of the
-                    # input or a comma.
+                    # Outside forgiving selector lists, :scope is only
+                    # supported at the start of a selector.
                     preceding = stream.used[:selector_start]
                     while preceding and preceding[-1].type == "S":
                         preceding = preceding[:-1]
-                    if inside_selector_list or (
-                        preceding and not preceding[-1].is_delim(",")
+                    if (
+                        not inside_forgiving_selector_list
+                        and preceding
+                        and not preceding[-1].is_delim(",")
                     ):
                         raise SelectorSyntaxError(
                             'Got pseudo-class ":scope" not at the start of a selector'
@@ -690,14 +689,10 @@ def parse_simple_selector(
             stream.next()
             stream.skip_whitespace()
             if ident.lower() == "not":
-                if inside_selector_list:
-                    raise SelectorSyntaxError(
-                        ":not() is not supported inside :is(), :where() and :matches()"
-                    )
-                if inside_negation:
-                    raise SelectorSyntaxError("Got nested :not()")
                 argument, argument_pseudo_element = parse_simple_selector(
-                    stream, inside_negation=True
+                    stream,
+                    inside_negation=True,
+                    inside_forgiving_selector_list=inside_forgiving_selector_list,
                 )
                 while 1:
                     # Whitespace before the closing parenthesis is not a
@@ -720,7 +715,9 @@ def parse_simple_selector(
                     else:
                         argument_combinator = " "
                     next_selector, argument_pseudo_element = parse_simple_selector(
-                        stream, inside_negation=True
+                        stream,
+                        inside_negation=True,
+                        inside_forgiving_selector_list=inside_forgiving_selector_list,
                     )
                     argument = CombinedSelector(
                         argument, argument_combinator, next_selector
@@ -731,10 +728,10 @@ def parse_simple_selector(
                 result = Relation(result, combinator, arguments)
 
             elif ident.lower() in ("matches", "is"):
-                selectors = parse_simple_selector_arguments(stream)
+                selectors = parse_forgiving_selector_arguments(stream)
                 result = Matching(result, selectors)
             elif ident.lower() == "where":
-                selectors = parse_simple_selector_arguments(stream)
+                selectors = parse_forgiving_selector_arguments(stream)
                 result = SpecificityAdjustment(result, selectors)
             else:
                 result = Function(result, ident, parse_arguments(stream))
@@ -797,27 +794,69 @@ def parse_relative_selector(stream: TokenStream) -> tuple[Token, Selector]:
     return combinator, Selector(result)
 
 
-def parse_simple_selector_arguments(stream: TokenStream) -> list[Tree]:
+def parse_forgiving_selector_arguments(stream: TokenStream) -> list[Tree]:
+    """Parse the forgiving selector list of :is(), :where() or :matches().
+
+    Each comma-separated branch is parsed independently. A syntactically
+    invalid branch is discarded without invalidating the other branches.
+    """
     arguments = []
-    while 1:
-        result, pseudo_element = parse_simple_selector(
-            stream, inside_negation=True, inside_selector_list=True
-        )
-        if pseudo_element:
-            raise SelectorSyntaxError(
-                f"Got pseudo-element ::{pseudo_element} inside function"
+    for tokens, close in _split_forgiving_selector_arguments(stream):
+        try:
+            tree, pseudo_element = parse_selector(
+                TokenStream([*tokens, EOFToken(close.pos + 1)], stream.source),
+                inside_forgiving_selector_list=True,
             )
-        stream.skip_whitespace()
-        next_ = stream.next()
-        if next_ == ("DELIM", ","):
-            stream.skip_whitespace()
-            arguments.append(result)
-        elif next_ == ("DELIM", ")"):
-            arguments.append(result)
-            break
-        else:
-            raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+        except SelectorSyntaxError:
+            continue
+        if pseudo_element:
+            continue
+        arguments.append(tree)
     return arguments
+
+
+def _split_forgiving_selector_arguments(
+    stream: TokenStream,
+) -> list[tuple[list[Token], Token]]:
+    branches: list[tuple[list[Token], Token]] = []
+    branch: list[Token] = []
+    parenthesis_depth = bracket_depth = 0
+
+    while True:
+        token = stream.next()
+        if token.type == "EOF":
+            raise SelectorSyntaxError(f"Expected an argument, got {token}")
+        if token.is_delim("("):
+            parenthesis_depth += 1
+        elif token.is_delim("["):
+            bracket_depth += 1
+        elif token.is_delim(")") and parenthesis_depth:
+            parenthesis_depth -= 1
+        elif token.is_delim("]") and bracket_depth:
+            bracket_depth -= 1
+        elif token == ("DELIM", ")") and bracket_depth == 0:
+            branches.append((_trim_selector_tokens(branch), token))
+            break
+        elif token == ("DELIM", ",") and parenthesis_depth == bracket_depth == 0:
+            branches.append((_trim_selector_tokens(branch), token))
+            branch = []
+            continue
+
+        branch.append(token)
+
+    if parenthesis_depth or bracket_depth:
+        raise SelectorSyntaxError(f"Expected an argument, got {stream.peek()}")
+    return branches
+
+
+def _trim_selector_tokens(tokens: list[Token]) -> list[Token]:
+    start = 0
+    end = len(tokens)
+    while start < end and tokens[start].type == "S":
+        start += 1
+    while end > start and tokens[end - 1].type == "S":
+        end -= 1
+    return tokens[start:end]
 
 
 def parse_attrib(selector: Tree, stream: TokenStream) -> Attrib:
@@ -1055,9 +1094,13 @@ def tokenize(s: str) -> Iterator[Token]:
     s = _sub_invalid_input_char("\N{REPLACEMENT CHARACTER}", s)
     pos = 0
     len_s = len(s)
+    function_name_stack: list[str | None] = []
+    last_ident: str | None = None
+    last_ident_end: int | None = None
     while pos < len_s:
         match = _match_whitespace(s, pos=pos)
         if match:
+            last_ident = None
             yield Token("S", " ", pos)
             pos = match.end()
             continue
@@ -1065,6 +1108,8 @@ def tokenize(s: str) -> Iterator[Token]:
         match = _match_ident(s, pos=pos)
         if match:
             value = unescape_ident(match.group())
+            last_ident = value
+            last_ident_end = match.end()
             yield Token("IDENT", value, pos)
             pos = match.end()
             continue
@@ -1072,6 +1117,7 @@ def tokenize(s: str) -> Iterator[Token]:
         match = _match_hash(s, pos=pos)
         if match:
             value = unescape_ident(match.group()[1:])
+            last_ident = None
             yield Token("HASH", value, pos)
             pos = match.end()
             continue
@@ -1081,16 +1127,30 @@ def tokenize(s: str) -> Iterator[Token]:
             match = _match_string_by_quote[quote](s, pos=pos + 1)
             assert match, "Should have found at least an empty match"
             end_pos = match.end()
-            if end_pos == len_s:
-                raise SelectorSyntaxError(f"Unclosed string at {pos}")
-            if s[end_pos] != quote:
-                raise SelectorSyntaxError(f"Invalid string at {pos}")
+            in_forgiving_list = any(
+                ascii_lower(name or "") in ("is", "where", "matches")
+                for name in function_name_stack
+            )
             value = _sub_simple_escape(
                 _replace_simple,
                 _sub_unicode_escape(
                     _replace_unicode, _sub_newline_escape("", match.group())
                 ),
             )
+            if end_pos == len_s:
+                if in_forgiving_list:
+                    yield Token("STRING", value, pos)
+                    pos = end_pos
+                    continue
+                raise SelectorSyntaxError(f"Unclosed string at {pos}")
+            if s[end_pos] != quote:
+                if in_forgiving_list:
+                    yield Token("STRING", value, pos)
+                    quote_pos = end_pos + 1
+                    yield Token("DELIM", quote, quote_pos)
+                    pos = quote_pos + 1
+                    continue
+                raise SelectorSyntaxError(f"Invalid string at {pos}")
             yield Token("STRING", value, pos)
             pos = end_pos + 1
             continue
@@ -1098,6 +1158,7 @@ def tokenize(s: str) -> Iterator[Token]:
         match = _match_number(s, pos=pos)
         if match:
             value = match.group()
+            last_ident = None
             yield Token("NUMBER", value, pos)
             pos = match.end()
             continue
@@ -1109,9 +1170,19 @@ def tokenize(s: str) -> Iterator[Token]:
                 pos = len_s
             else:
                 pos += 2
+            last_ident = None
             continue
 
-        yield Token("DELIM", s[pos], pos)
+        delim = s[pos]
+        if delim == "(":
+            if last_ident_end == pos and last_ident is not None:
+                function_name_stack.append(ascii_lower(last_ident))
+            else:
+                function_name_stack.append(None)
+        elif delim == ")" and function_name_stack:
+            function_name_stack.pop()
+        last_ident = None
+        yield Token("DELIM", delim, pos)
         pos += 1
 
     assert pos == len_s

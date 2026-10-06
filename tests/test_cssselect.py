@@ -391,6 +391,89 @@ class TestCssselect(unittest.TestCase):
             3,
         )
 
+    def test_forgiving_selector_list(self) -> None:
+        translator = GenericTranslator()
+
+        def check(
+            css: str,
+            canonical: str,
+            specificity_value: tuple[int, int, int],
+            xpath_value: str,
+        ) -> None:
+            (selector,) = parse(css)
+            assert selector.canonical() == canonical
+            assert selector.specificity() == specificity_value
+            assert translator.selector_to_xpath(selector, prefix="") == xpath_value
+
+            (reparsed,) = parse(canonical)
+            assert reparsed.canonical() == canonical
+            assert reparsed.specificity() == specificity_value
+            assert translator.selector_to_xpath(reparsed, prefix="") == xpath_value
+
+        check(
+            "e:is(.good, ???)",
+            "e:is(.good)",
+            (0, 1, 1),
+            "e[@class and contains(@class, 'good') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' good ')]",
+        )
+        check(
+            ":is(.good, :nth-child(1, 2), .fine)",
+            ":is(.good, .fine)",
+            (0, 1, 0),
+            "*[(@class and contains(@class, 'good') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' good ')) or "
+            "(@class and contains(@class, 'fine') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' fine '))]",
+        )
+        check(
+            r":is(.good, .bad\,more, .fine)",
+            r":is(.good, .bad\,more, .fine)",
+            (0, 1, 0),
+            "*[(@class and contains(@class, 'good') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' good ')) or "
+            "(@class and contains(@class, 'bad,more') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' bad,more ')) or "
+            "(@class and contains(@class, 'fine') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' fine '))]",
+        )
+        check(
+            ':is(.good, "bad\n", .fine)',
+            ":is(.good, .fine)",
+            (0, 1, 0),
+            "*[(@class and contains(@class, 'good') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' good ')) or "
+            "(@class and contains(@class, 'fine') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' fine '))]",
+        )
+        check(":is(???, :before)", ":is()", (0, 0, 0), "*[0]")
+        check("e:where(???, :before)", "e:where()", (0, 0, 1), "e[0]")
+        check(
+            ":where(:is(#a, ???))",
+            ":where(:is(#a))",
+            (0, 0, 0),
+            "*[@id = 'a']",
+        )
+        check(
+            ":is(:not(:not(a)), .b)",
+            ":is(:not(:not(a)), .b)",
+            (0, 1, 0),
+            "*[(not(not(self::a))) or (@class and contains(@class, 'b') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' b '))]",
+        )
+
+        with pytest.raises(SelectorSyntaxError):
+            parse("e, ???")
+        (unsupported_selector,) = parse(":is(.good, :unknown())")
+        assert unsupported_selector.canonical() == ":is(.good, :unknown())"
+        assert unsupported_selector.specificity() == (0, 1, 0)
+        with pytest.raises(ExpressionError, match=":scope"):
+            translator.css_to_xpath(":is(:scope)")
+        with pytest.raises(ExpressionError, match=":unknown"):
+            translator.css_to_xpath(":is(.good, :unknown())")
+        with pytest.raises(ExpressionError, match=":unknown"):
+            translator.css_to_xpath(":is(*, :unknown())")
+
     def test_css_export(self) -> None:
         def css2css(css: str, res: str | None = None) -> None:
             selectors = parse(css)
@@ -539,6 +622,10 @@ class TestCssselect(unittest.TestCase):
         assert get_error(':contains("foo') == ("Unclosed string at 10")
         # A raw newline terminates the string match without closing it.
         assert get_error('[a="b\nc"]') == ("Invalid string at 3")
+        assert get_error(':is(.good, "bad\n", .fine)') is None
+        assert get_error(':is(.good, "bad, .fine)') == (
+            "Expected an argument, got <EOF at 23>"
+        )
         assert get_error("foo!") == ("Expected selector, got <DELIM '!' at 3>")
         # An unclosed comment runs to the end of the input and is ignored.
         assert get_error("a /* unclosed") is None
@@ -563,7 +650,7 @@ class TestCssselect(unittest.TestCase):
         assert get_error(":not(:before)") == (
             "Got pseudo-element ::before inside :not() at 12"
         )
-        assert get_error(":not(:not(a))") == ("Got nested :not()")
+        assert get_error(":not(:not(a))") is None
         assert get_error(":not(a > :before)") == (
             "Got pseudo-element ::before inside :not() at 16"
         )
@@ -576,30 +663,17 @@ class TestCssselect(unittest.TestCase):
         assert get_error(":not( a )") is None
         assert get_error("e:not(.a )") is None
         assert get_error(":not([a] )") is None
-        # A :not() inside :is()/:where()/:matches() is not a nested :not()
-        # and gets its own message
-        assert get_error(":is(:not(a))") == (
-            ":not() is not supported inside :is(), :where() and :matches()"
-        )
-        assert get_error(":where(:not(a))") == (
-            ":not() is not supported inside :is(), :where() and :matches()"
-        )
-        assert get_error(":matches(:not(a))") == (
-            ":not() is not supported inside :is(), :where() and :matches()"
-        )
-        assert get_error(":is(:before)") == (
-            "Got pseudo-element ::before inside function"
-        )
-        assert get_error(":is(a b)") == ("Expected an argument, got <IDENT 'b' at 6>")
-        assert get_error(":where(:before)") == (
-            "Got pseudo-element ::before inside function"
-        )
-        assert get_error(":where(a b)") == (
-            "Expected an argument, got <IDENT 'b' at 9>"
-        )
+        # Forgiving lists discard their own syntactically invalid branches.
+        assert get_error(":is(:not(a))") is None
+        assert get_error(":where(:not(a))") is None
+        assert get_error(":matches(:not(a))") is None
+        assert get_error(":is(:before)") is None
+        assert get_error(":is(a b)") is None
+        assert get_error(":where(:before)") is None
+        assert get_error(":where(a b)") is None
         assert get_error(":is(a") == ("Expected an argument, got <EOF at 5>")
-        assert get_error(":is(a,") == ("Expected selector, got <EOF at 6>")
-        assert get_error(":is(a,)") == ("Expected selector, got <DELIM ')' at 6>")
+        assert get_error(":is(a,") == ("Expected an argument, got <EOF at 6>")
+        assert get_error(":is(a,)") is None
         assert get_error(":where(a") == ("Expected an argument, got <EOF at 8>")
         assert get_error(":scope > div :scope header") == (
             'Got pseudo-class ":scope" not at the start of a selector'
@@ -616,23 +690,13 @@ class TestCssselect(unittest.TestCase):
         assert get_error("*:scope") is None
         assert get_error("div:scope") is None
         assert get_error("foo, *:scope") is None
-        # :scope is rejected in :is()/:where()/:matches() arguments too;
-        # a comma there separates arguments, not selectors.
-        assert get_error(":is(:scope)") == (
-            'Got pseudo-class ":scope" not at the start of a selector'
-        )
-        assert get_error(":is(a, :scope)") == (
-            'Got pseudo-class ":scope" not at the start of a selector'
-        )
-        assert get_error(":where(a, :scope)") == (
-            'Got pseudo-class ":scope" not at the start of a selector'
-        )
-        assert get_error(":matches(a, :scope)") == (
-            'Got pseudo-class ":scope" not at the start of a selector'
-        )
-        assert get_error("foo, :is(a, :scope)") == (
-            'Got pseudo-class ":scope" not at the start of a selector'
-        )
+        # :scope is syntactically valid in forgiving lists but cannot be
+        # translated in this non-relative context.
+        assert get_error(":is(:scope)") is None
+        assert get_error(":is(a, :scope)") is None
+        assert get_error(":where(a, :scope)") is None
+        assert get_error(":matches(a, :scope)") is None
+        assert get_error("foo, :is(a, :scope)") is None
         assert get_error("> div p") == ("Expected selector, got <DELIM '>' at 0>")
 
         # Unsupported :has() with several arguments
@@ -828,6 +892,7 @@ class TestCssselect(unittest.TestCase):
         assert xpath("e:not(a:has(> b) c)") == (
             "e[not(self::c and ancestor::*[(./b) and (self::a)])]"
         )
+        assert xpath("e:not(:not(a))") == "e[not(not(self::a))]"
         # Element-reading pseudo-classes chained after :has()
         assert xpath("e:has(f):first-of-type") == (
             "e[(descendant::f) and (count(preceding-sibling::e) = 0)]"
@@ -873,6 +938,19 @@ class TestCssselect(unittest.TestCase):
         assert xpath("e:where(foo)") == "e[self::foo]"
         assert xpath("e:where(foo, bar)") == "e[(self::foo) or (self::bar)]"
         assert xpath("e:is(.a,.b)") == xpath("e:is(.a, .b)")
+        assert xpath("e:is()") == "e[0]"
+        assert xpath("e:where(.a, ???)") == (
+            "e[@class and contains(@class, 'a') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' a ')]"
+        )
+        assert xpath("e:is(.a, ???, .b)") == (
+            "e[(@class and contains(@class, 'a') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' a ')) or "
+            "(@class and contains(@class, 'b') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' b '))]"
+        )
+        assert xpath("e:is(a b)") == "e[self::b and ancestor::*[self::a]]"
+        assert xpath("e:is(:not(a))") == "e[not(self::a)]"
         assert xpath("e:is(*, .foo)") == "e"
         assert xpath("e:where(*, foo)") == "e"
         assert xpath("e.foo:is(.a, .b)") == (
@@ -901,6 +979,10 @@ class TestCssselect(unittest.TestCase):
         assert xpath("e:is(ns|f)") == "e[self::ns:f]"
         assert xpath("*:not(ns|f)") == "*[not(self::ns:f)]"
         assert xpath("*:not(ns|f > f)") == "*[not(self::f and parent::*[self::ns:f])]"
+        with pytest.raises(ExpressionError, match=":scope"):
+            xpath("e:is(:scope)")
+        with pytest.raises(ExpressionError, match=":unknown"):
+            xpath("e:is(.a, :unknown())")
         assert xpath("x + ns|f") == (
             "x/following-sibling::*[(self::ns:f) and (position() = 1)]"
         )
@@ -995,18 +1077,14 @@ class TestCssselect(unittest.TestCase):
 
         assert LowerValues().css_to_xpath("[Foo=BAR]", prefix="") == "*[@Foo = 'bar']"
 
-        # A member of an :is()/:where() selector list that translates to a
-        # path (rather than a predicate) cannot be embedded in the outer
-        # predicate and is rejected. The parser does not currently produce
-        # such an argument, so build the Matching node directly.
+        # A complex selector in an :is()/:where() selector list is matched
+        # against the context element through reverse axes.
         base = parse("x")[0].parsed_tree
         combined = parse("a b")[0].parsed_tree
         matching = Matching(base, [combined])
-        with pytest.raises(
-            ExpressionError,
-            match=r"not supported inside :is\(\), :where\(\) and :matches\(\)",
-        ):
-            GenericTranslator().xpath(matching)
+        assert str(GenericTranslator().xpath(matching)) == (
+            "x[self::b and ancestor::*[self::a]]"
+        )
 
     def test_add_name_test(self) -> None:
         # Directly exercise XPathExpr.add_name_test(), part of the
@@ -1588,6 +1666,16 @@ class TestCssselect(unittest.TestCase):
             "sixth-li",
             "seventh-li",
         ]
+        assert pcss(":is(li, ???)") == pcss("li")
+        assert pcss(":is(.c, ???)", ":where(.c, ???)") == [
+            "first-ol",
+            "third-li",
+            "fourth-li",
+        ]
+        assert pcss(":where(#first-li, ???)") == ["first-li"]
+        assert pcss(":is(:is(#first-li, ???), ???)") == ["first-li"]
+        assert pcss(":is(???, :before)") == []
+        assert pcss(":where(???, :before)") == []
         assert pcss("ol.a:is(.nonexistent)") == []
         assert pcss("ol.a:is(.b, .nonexistent)") == ["first-ol"]
         assert pcss("ol.a.b.c > li.c:nth-child(3)") == ["third-li"]

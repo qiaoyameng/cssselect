@@ -108,11 +108,11 @@ be implemented):
 
 * The ``:scope`` pseudo-class. Limitation: it can only be used at a start of a
   selector.
-* The ``:is()`` and ``:where()`` pseudo-classes. Limitation: their arguments
-  are a comma-separated list of *compound selectors*; combinators are not
-  allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope`` are
-  also rejected inside them, while ``:has()`` is supported (e.g.
-  ``:is(:has(> a))``).
+* The ``:is()`` and ``:where()`` pseudo-classes, including their forgiving
+  selector lists: syntactically invalid branches are discarded without making
+  the other branches invalid. Complex selectors and nested ``:not()`` are
+  supported (e.g. ``:is(a > b, :not(c))``). ``:scope`` is syntactically
+  accepted but cannot be translated in this XPath context.
 * The ``:has()`` pseudo-class. Limitation: it takes a single argument, made of
   an optional leading combinator (``>``, ``+`` or ``~``) followed by one
   *compound selector* built only from type, class and universal selectors
