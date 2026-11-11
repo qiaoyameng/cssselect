@@ -24,6 +24,7 @@ from cssselect.parser import (
     Element,
     Function,
     Hash,
+    Language,
     Matching,
     Negation,
     Pseudo,
@@ -764,13 +765,60 @@ class GenericTranslator:
         value = cast("str", function.arguments[0].value)
         return xpath.add_condition(f"contains(., {self.xpath_literal(value)})")
 
-    def xpath_lang_function(self, xpath: XPathExpr, function: Function) -> XPathExpr:
-        if function.argument_types() not in (["STRING"], ["IDENT"]):
-            raise ExpressionError(
-                f"Expected a single string or ident for :lang(), got {function.arguments!r}"
+    def xpath_language(self, language: Language) -> XPathExpr:
+        """Translate the :lang() pseudo-class with an RFC 4647 range list."""
+        xpath = self.xpath(language.selector)
+        if not language.ranges:
+            # ":lang()" has no range to match.
+            return xpath.add_condition("0")
+        return xpath.add_condition(
+            _or_conditions(
+                [
+                    self._xpath_language_range_condition(range_)
+                    for range_ in language.ranges
+                ]
             )
-        value = cast("str", function.arguments[0].value)
-        return xpath.add_condition(f"lang({self.xpath_literal(value)})")
+        )
+
+    def _xpath_language_range_condition(self, range_: str) -> str:
+        """Return an XPath 1.0 condition for one language range, evaluated
+        against the nearest ancestor (or the element itself) that carries a
+        language attribute."""
+        nearest = f"ancestor-or-self::*[@{self.lang_attribute}][1]"
+        attribute = f"@{self.lang_attribute}"
+        if range_ == "":
+            # Selectors 4: the empty range matches elements whose effective
+            # language declaration is empty, which overrides inheritance.
+            return f"{nearest}[string-length({attribute}) = 0]"
+        if range_ == "*":
+            # The wildcard range matches any non-empty language tag.
+            return f"{nearest}[string-length({attribute}) != 0]"
+        return f"{nearest}[{self._xpath_language_range_match(attribute, range_)}]"
+
+    def _xpath_language_range_match(self, attribute: str, range_: str) -> str:
+        """Match a language tag against a single non-wildcard language range,
+        segment by segment (RFC 4647), using XPath 1.0 only.
+
+        A trailing dash turns the last segment into an anchored prefix test,
+        so "en" does not match "enus". The tag value is ASCII-lowercased and
+        the range is stored already lower-cased.
+        """
+        remaining = f"concat(translate({attribute}, {self.xpath_literal(ascii_uppercase)}, {self.xpath_literal(ascii_lowercase)}), '-')"
+        conditions: list[str] = []
+        for segment in range_.split("-"):
+            if segment == "*":
+                # The wildcard matches exactly one subtag: one more segment
+                # must remain, then drop it (up to and including its dash).
+                conditions.append(f"contains({remaining}, '-')")
+                remaining = (
+                    f"substring-after({remaining}, "
+                    f"concat(substring-before({remaining}, '-'), '-'))"
+                )
+            else:
+                literal = self.xpath_literal(segment + "-")
+                conditions.append(f"starts-with({remaining}, {literal})")
+                remaining = f"substring-after({remaining}, {literal})"
+        return " and ".join(conditions)
 
     # Pseudo: dispatch by pseudo-class name
 
@@ -952,23 +1000,6 @@ class HTMLTranslator(GenericTranslator):
             "(@checked "
             "and (name(.) = 'input' or name(.) = 'command')"
             "and (@type = 'checkbox' or @type = 'radio'))"
-        )
-
-    def xpath_lang_function(self, xpath: XPathExpr, function: Function) -> XPathExpr:
-        if function.argument_types() not in (["STRING"], ["IDENT"]):
-            raise ExpressionError(
-                f"Expected a single string or ident for :lang(), got {function.arguments!r}"
-            )
-        value = cast("str", function.arguments[0].value)
-        # Language-range matching is ASCII case-insensitive (RFC 4647),
-        # like the translate() on the document side of the comparison.
-        arg = self.xpath_literal(ascii_lower(value) + "-")
-        return xpath.add_condition(
-            "ancestor-or-self::*[@lang][1][starts-with(concat("
-            # XPath 1.0 has no lower-case function...
-            f"translate(@{self.lang_attribute}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-            "'abcdefghijklmnopqrstuvwxyz'), "
-            f"'-'), {arg})]"
         )
 
     def xpath_link_pseudo(self, xpath: XPathExpr) -> XPathExpr:

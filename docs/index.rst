@@ -122,6 +122,17 @@ be implemented):
 * The ``:not()`` pseudo-class with a *complex selector* argument, e.g.
   ``:not(a.important[rel] > b)``. Limitation: it takes a single argument, so a
   selector list is unsupported (e.g. ``:not(a, b)``).
+* The ``:lang()`` pseudo-class with a comma-separated list of language
+  ranges, e.g. ``:lang(en, fr, "en-GB")``. Ranges are matched subtag by
+  subtag according to RFC 4647, so ``:lang(en)`` does not match a tag like
+  ``enus``; quoted ranges may contain the wildcard subtag ``*``, which stands
+  for exactly one subtag (e.g. ``:lang("zh-*-TW")``). ``:lang("*")`` matches
+  any non-empty tag and ``:lang("")`` matches an empty language declaration.
+  The effective language is inherited from the nearest element with a
+  ``lang`` (HTML) or ``xml:lang`` (XML) attribute, and an empty declaration
+  overrides inheritance. Invalid ranges raise
+  :class:`~cssselect.SelectorSyntaxError`. Limitation: the generated XPath
+  only uses XPath 1.0 functions.
 
 These are non-standard extensions:
 

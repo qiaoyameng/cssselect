@@ -56,6 +56,7 @@ Tree: TypeAlias = Union[
     "Hash",
     "Class",
     "Function",
+    "Language",
     "Pseudo",
     "Attrib",
     "Negation",
@@ -217,6 +218,40 @@ class Function:
     def canonical(self) -> str:
         args = "".join(token.css() for token in self.arguments)
         return f"{self.selector.canonical()}:{_serialize_ident(self.name)}({args})"
+
+    def specificity(self) -> tuple[int, int, int]:
+        a, b, c = self.selector.specificity()
+        b += 1
+        return a, b, c
+
+
+class Language:
+    """
+    Represents selector:lang(range-list)
+
+    .. attribute:: ranges
+
+        The arguments as a list of language ranges (strings), in source
+        order, each normalized for ASCII case-insensitive matching by
+        folding ASCII letters to lower case. An empty string is the
+        special Selectors 4 range that matches elements whose language
+        is not tagged, and ``"*"`` is the RFC 4647 wildcard range that
+        matches any non-empty language tag.
+
+    """
+
+    def __init__(self, selector: Tree, ranges: Sequence[str]) -> None:
+        self.selector = selector
+        self.ranges = list(ranges)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}[{self.selector!r}:lang({self.ranges!r})]"
+
+    def canonical(self) -> str:
+        # Ranges are quoted as CSS strings: the empty range and the "*"
+        # wildcard are not valid idents on their own.
+        ranges = ", ".join(Token("STRING", range_, 0).css() for range_ in self.ranges)
+        return f"{self.selector.canonical()}:lang({ranges})"
 
     def specificity(self) -> tuple[int, int, int]:
         a, b, c = self.selector.specificity()
@@ -546,6 +581,13 @@ _class_re = re.compile(
     r"^[ \t\r\n\f]*([a-zA-Z]*)\.([a-zA-Z][a-zA-Z0-9_-]*)[ \t\r\n\f]*$"
 )
 
+# RFC 4646 subtags: the primary subtag is 1 to 8 ASCII letters, later
+# subtags are 1 to 8 ASCII letters or digits. In an RFC 4647 extended
+# language range, any subtag may instead be the single "*" wildcard, which
+# matches exactly one subtag of the language tag.
+_match_language_primary_subtag = re.compile(r"[A-Za-z]{1,8}").fullmatch
+_match_language_subtag = re.compile(r"[A-Za-z0-9]{1,8}").fullmatch
+
 
 def parse(css: str) -> list[Selector]:
     """Parse a CSS *group of selectors*.
@@ -767,6 +809,8 @@ def parse_simple_selector(
             elif ident.lower() == "where":
                 selectors = parse_simple_selector_arguments(stream)
                 result = SpecificityAdjustment(result, selectors)
+            elif ident.lower() == "lang":
+                result = Language(result, parse_language_ranges(stream))
             else:
                 result = Function(result, ident, parse_arguments(stream))
         else:
@@ -790,6 +834,54 @@ def parse_arguments(stream: TokenStream) -> list[Token]:  # noqa: RET503
             return arguments
         else:
             raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+
+
+def _check_language_range(value: str, token: Token) -> None:
+    """Validate one RFC 4647 basic/extended language range."""
+    if value == "" or value == "*":
+        return
+    subtags = value.split("-")
+    # An empty subtag means a leading, trailing or doubled dash.
+    if "" in subtags or (
+        subtags[0] != "*" and not _match_language_primary_subtag(subtags[0])
+    ):
+        raise SelectorSyntaxError(
+            f"Invalid language range {value!r} in :lang() at {token.pos}"
+        )
+    if all(subtag == "*" or _match_language_subtag(subtag) for subtag in subtags[1:]):
+        return
+    raise SelectorSyntaxError(
+        f"Invalid language range {value!r} in :lang() at {token.pos}"
+    )
+
+
+def parse_language_ranges(stream: TokenStream) -> list[str]:
+    """Parse the comma-separated language range list of a :lang() argument."""
+    ranges: list[str] = []
+    # An empty argument list, e.g. ":lang()", matches no element: it used to
+    # be accepted by the parser and rejected at translation time.
+    stream.skip_whitespace()
+    if stream.peek() == ("DELIM", ")"):
+        stream.next()
+        return ranges
+    while 1:
+        stream.skip_whitespace()
+        token = stream.next()
+        if token.type not in ("IDENT", "STRING"):
+            raise SelectorSyntaxError(
+                f"Expected a language range in :lang(), got {token}"
+            )
+        value = cast("str", token.value)
+        _check_language_range(value, token)
+        ranges.append(ascii_lower(value))
+        stream.skip_whitespace()
+        next_ = stream.next()
+        if next_ == ("DELIM", ")"):
+            return ranges
+        if not next_.is_delim(","):
+            raise SelectorSyntaxError(
+                f"Expected ',' or ')' in :lang(), got {next_}"
+            )
 
 
 def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]:

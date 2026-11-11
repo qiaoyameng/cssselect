@@ -1,6 +1,43 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+*   ``:lang()`` now accepts a comma-separated list of language ranges, e.g.
+    ``:lang(en, fr, "en-GB")``, where an element matches when any of the
+    ranges matches its effective language. Ranges follow the RFC 4647
+    matching rules:
+
+    * ranges are matched subtag by subtag rather than with a string prefix,
+      so ``:lang(en)`` no longer matches a tag like ``"enus"``;
+    * the wildcard subtag ``*`` (only usable inside a quoted range, e.g.
+      ``:lang("*-CH", "en-*-US")``) matches exactly one subtag, the lone
+      ``:lang("*")`` range matches any non-empty tag, and the empty
+      ``:lang("")`` range matches elements whose effective declaration is
+      an empty language attribute;
+    * invalid ranges are rejected at parse time with a
+      :class:`~cssselect.SelectorSyntaxError` pointing at the offending
+      token, e.g. ``:lang(1)`` or ``:lang("en--US")``.
+
+    The single-argument form, e.g. ``:lang(fr)``, keeps working.
+
+*   **Backward-incompatible change**: ``:lang()`` is now represented by a
+    dedicated ``Language`` parsed object (exposing the normalized ranges as
+    ``ranges``) instead of a :class:`~cssselect.parser.Function` node.
+    ``GenericTranslator.xpath_lang_function()`` and
+    ``HTMLTranslator.xpath_lang_function()`` are replaced by
+    ``GenericTranslator.xpath_language()`` and the
+    ``_xpath_language_range_*()`` helpers. The generated XPath still uses
+    XPath 1.0 semantics only.
+
+*   ``:lang()`` now resolves the effective language from the nearest
+    element with a language attribute in both translators:
+    :class:`~cssselect.HTMLTranslator` walks ``lang`` and
+    :class:`~cssselect.GenericTranslator` walks ``xml:lang``. An empty
+    declaration therefore overrides an inherited language instead of being
+    ignored.
+
 Version 1.6.0
 -------------
 
