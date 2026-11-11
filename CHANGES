@@ -1,6 +1,19 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+*   Added an opt-in *forgiving selector list* mode for ``:is()`` and
+    ``:where()`` (Selectors Level 4), via ``forgiving=True`` on
+    :func:`cssselect.parse` or the ``forgiving`` attribute of translators:
+    invalid or unsupported arguments are skipped instead of making the whole
+    selector invalid, and when every argument is dropped the generated XPath
+    condition never matches. The top-level selector group, ``:matches()``,
+    ``:not()`` and ``:has()`` stay strict. Skipped arguments are reported as
+    :class:`cssselect.SelectorParseIssue` diagnostics with their source range
+    and reason.
+
 Version 1.6.0
 -------------
 

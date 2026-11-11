@@ -112,7 +112,8 @@ be implemented):
   are a comma-separated list of *compound selectors*; combinators are not
   allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope`` are
   also rejected inside them, while ``:has()`` is supported (e.g.
-  ``:is(:has(> a))``).
+  ``:is(:has(> a))``). They can additionally be parsed as *forgiving selector
+  lists* (see below).
 * The ``:has()`` pseudo-class, e.g. ``:has(> a.important, + p b)``. Limitation:
   ``:scope`` is rejected inside it.
 * The ``i`` and ``s`` attribute selector flags, e.g. ``[href^="HTTP" i]``.
@@ -134,6 +135,64 @@ These are non-standard extensions:
   ``:not([foo=bar])``, except for an empty value: ``[foo!='']`` matches only
   elements that do have a ``foo`` attribute and whose value is not empty,
   while ``:not([foo=''])`` also matches elements without a ``foo`` attribute.
+
+Forgiving selector lists
+-------------------------
+
+By default every invalid selector makes the whole group invalid and raises an
+error. This also applies to the arguments of ``:is()`` and ``:where()``: if a
+browser extension injects an unsupported pseudo-class into the list, the whole
+rule becomes unusable.
+
+Set the ``forgiving`` attribute of a translator to parse ``:is()`` and
+``:where()`` arguments as Selectors Level 4 *forgiving selector lists*:
+invalid or unsupported arguments are then skipped instead of failing the
+selector.
+
+.. sourcecode:: pycon
+
+    >>> from cssselect import GenericTranslator
+    >>> strict = GenericTranslator()
+    >>> strict.css_to_xpath(':is(:-moz-extension, .content)')
+    Traceback (most recent call last):
+        ...
+    cssselect.ExpressionError: The pseudo-class :-moz-extension is unknown
+    >>> forgiving = GenericTranslator()
+    >>> forgiving.forgiving = True
+    >>> forgiving.css_to_xpath(':is(:-moz-extension, .content)')
+    "descendant-or-self::*[@class and contains(@class, 'content') and contains(concat(' ', normalize-space(@class), ' '), ' content ')]"
+
+The same option is available on :func:`parse` together with an optional list of
+:class:`SelectorParseIssue` diagnostics, each giving the source range and the
+reason of a skipped argument:
+
+.. sourcecode:: pycon
+
+    >>> from cssselect import parse
+    >>> issues = []
+    >>> selectors = parse(':is(:scope, .content)', forgiving=True, issues=issues)
+    >>> selectors[0].canonical()
+    ':is(.content)'
+    >>> issues[0].start, issues[0].end
+    (4, 10)
+
+Details:
+
+* Only the selector lists of ``:is()`` and ``:where()`` are forgiving. The
+  top-level selector group, the non-standard ``:matches()`` alias, ``:not()``
+  and ``:has()`` keep their strict behavior. (Per the grammar, ``:not()`` is a
+  non-forgiving selector list; ``:has()`` is a forgiving *relative* selector
+  list in Selectors 4, but is not covered by this mode yet.)
+* Skipping follows the nesting of the input: a comma inside a string, an
+  attribute value or a nested function does not split an argument.
+* When every argument is dropped the generated condition never matches (an
+  XPath ``[0]`` predicate); it never degrades into a universal selector.
+* ``:where()`` still contributes zero specificity, and the specificity of
+  ``:is()`` is computed from the arguments that were kept.
+* The translator exposes the diagnostics of its last call as ``issues``.
+
+.. autoclass:: SelectorParseIssue
+    :members:
 
 .. _an early draft: http://www.w3.org/TR/2001/CR-css3-selectors-20011113/#content-selectors
 

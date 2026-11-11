@@ -29,6 +29,9 @@ from cssselect import (
     ExpressionError,
     GenericTranslator,
     HTMLTranslator,
+    Selector,
+    SelectorError,
+    SelectorParseIssue,
     SelectorSyntaxError,
     parse,
 )
@@ -37,6 +40,7 @@ from cssselect.parser import (
     FunctionalPseudoElement,
     Matching,
     PseudoElement,
+    SpecificityAdjustment,
     Token,
     parse_series,
     tokenize,
@@ -1073,6 +1077,168 @@ class TestCssselect(unittest.TestCase):
             GenericTranslator().css_to_xpath(4)  # type: ignore[arg-type]
         with pytest.raises(TypeError):
             GenericTranslator().selector_to_xpath("foo")  # type: ignore[arg-type]
+
+    def test_forgiving_selector_list_parsing(self) -> None:
+        def arguments(css: str) -> list[str]:
+            issues: list[SelectorParseIssue] = []
+            selectors = parse(css, forgiving=True, issues=issues)
+            assert len(selectors) == 1
+            tree = selectors[0].parsed_tree
+            assert isinstance(tree, (Matching, SpecificityAdjustment))
+            return [Selector(argument).canonical() for argument in tree.selector_list]
+
+        def dropped(css: str) -> list[tuple[str, str]]:
+            issues: list[SelectorParseIssue] = []
+            parse(css, forgiving=True, issues=issues)
+            return [(css[issue.start : issue.end], issue.reason) for issue in issues]
+
+        # An invalid argument is skipped wherever it appears in the list
+        assert arguments(":is(:lang(fr,en), .ok)") == [".ok"]
+        assert arguments(":is(.ok, :lang(fr,en))") == [".ok"]
+        assert arguments(":is(.a, :lang(fr,en), .b)") == [".a", ".b"]
+        assert arguments(":where(:lang(fr,en), .ok)") == [".ok"]
+        # ... including in a nested forgiving list
+        assert arguments(":is(.a, :is(:lang(fr,en), .b), .c)") == [
+            ".a",
+            ":is(.b)",
+            ".c",
+        ]
+        # A pseudo-element argument is skipped
+        assert arguments(":is(a, ::before, b)") == ["a", "b"]
+        # Commas inside strings, escapes and attribute values do not split
+        assert arguments(':is([data-x="a,b"], .ok)') == ["[data-x='a,b']", ".ok"]
+        assert arguments(r":is(.a\(b\,c\), .ok)") == [r".a\(b\,c\)", ".ok"]
+        # An empty argument is skipped too
+        assert arguments(":is(a,,b)") == ["a", "b"]
+        # Every argument invalid: the list is empty but the parse succeeds
+        assert arguments(":is(:lang(fr,en))") == []
+        assert arguments(":is(:lang(fr,en), :not(x))") == []
+        # :matches() is a non-standard alias and stays strictly parsed
+        with pytest.raises(SelectorSyntaxError):
+            parse(":matches(a b, .ok)", forgiving=True)
+        # :not() and :has() are not forgiving selector lists
+        with pytest.raises(SelectorSyntaxError):
+            parse(":not(:bad, a)", forgiving=True)
+        with pytest.raises(SelectorSyntaxError):
+            parse(":has(a,)", forgiving=True)
+        # The top-level selector group stays strict
+        with pytest.raises(SelectorSyntaxError):
+            parse("a,, .ok", forgiving=True)
+        with pytest.raises(SelectorSyntaxError):
+            parse("a,, .ok")
+        # An unclosed function still invalidates the whole selector
+        with pytest.raises(SelectorSyntaxError):
+            parse(":is(:bad(", forgiving=True)
+
+        # Diagnostics carry the source range and the reason of each drop
+        assert dropped(":is(:lang(fr,en), .ok)") == [
+            (":lang(fr,en)", "Expected an argument, got <DELIM ',' at 12>")
+        ]
+        assert dropped(":is(a, ::before, b)") == [
+            ("::before", "Got pseudo-element ::before inside function")
+        ]
+        assert dropped(":is(.a, :is(:lang(fr,en), .b), .c)") == [
+            (":lang(fr,en)", "Expected an argument, got <DELIM ',' at 20>")
+        ]
+        assert dropped(":is()") == [
+            ("", "Expected selector, got <DELIM ')' at 4>")
+        ]
+
+    def test_forgiving_selector_list_translation(self) -> None:
+        document = etree.fromstring(
+            "<r>"
+            '<e id="first" class="a"/>'
+            '<e id="second" class="ok b"/>'
+            '<e id="third" class="ok"/>'
+            '<c id="fourth"/>'
+            '<e id="fifth" class="a"/>'
+            "</r>"
+        )
+        translator = GenericTranslator()
+        translator.forgiving = True
+        strict = GenericTranslator()
+
+        def xpath(css: str) -> str:
+            return translator.css_to_xpath(css, prefix="")
+
+        def hits(css: str) -> list[str]:
+            items = typing.cast("list[etree._Element]", document.xpath(xpath(css)))
+            return [element.get("id") for element in items]
+
+        # A branch unsupported at translation time is dropped wherever it
+        # sits, with the retained branches producing the same hits as the
+        # equivalent selector without the bad branch.
+        assert xpath("e:is(:-moz-x, .ok)") == (
+            "e[@class and contains(@class, 'ok') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' ok ')]"
+        )
+        assert hits("e:is(:-moz-x, .ok)") == hits("e.ok") == ["second", "third"]
+        assert hits("e:is(.ok, :-moz-x)") == ["second", "third"]
+        assert hits("e:is(.a, :-moz-x, .b)") == ["first", "second", "fifth"]
+        assert hits("e:where(:-moz-x, .ok)") == ["second", "third"]
+        assert hits("*:is(.a, :is(:-moz-y, .b), c)") == [
+            "first",
+            "second",
+            "fourth",
+            "fifth",
+        ]
+        assert hits("*:is(.a, :is(:-moz-y, .b), c)") == hits(
+            "*:is(.a, :is(.b), c)"
+        )
+
+        # When every branch fails the condition never matches, rather than
+        # turning the selector into a universal match.
+        assert xpath("e:is(:-moz-x, :-moz-y)") == "e[0]"
+        assert xpath("e:where(:-moz-x)") == "e[0]"
+        assert hits("e:is(:-moz-x, :-moz-y)") == []
+        assert document.xpath(xpath("*:is(:-moz-x, :-moz-y)")) == []
+
+        # A surviving universal branch still matches everything.
+        assert xpath("e:is(*, :-moz-x)") == "e"
+
+        # Translation diagnostics carry the source range and reason.
+        translator.css_to_xpath("e:is(:-moz-x, .ok)", prefix="")
+        assert translator.issues is not None
+        issue = translator.issues[0]
+        assert (issue.start, issue.end) == (5, 12)
+        assert ":-moz-x" in issue.reason
+        translator.css_to_xpath("e", prefix="")
+        assert translator.issues == []
+
+        # The strict translator keeps raising on the same selectors.
+        for css in ("e:is(:-moz-x, .ok)", "e:is(:-moz-x)"):
+            with pytest.raises(ExpressionError):
+                strict.css_to_xpath(css)
+        # :matches(), :not() and :has() are not forgiving even when enabled.
+        for css in (
+            "e:matches(:-moz-x, .ok)",
+            "e:not(:-moz-x, .ok)",
+            "e:has(:-moz-x, .ok)",
+        ):
+            with pytest.raises(SelectorError):
+                translator.css_to_xpath(css)
+
+        # The HTML translator supports the same mode.
+        html_translator = HTMLTranslator()
+        html_translator.forgiving = True
+        assert html_translator.css_to_xpath(
+            "e:is(:-moz-x, .ok)", prefix=""
+        ) == (
+            "e[@class and contains(@class, 'ok') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' ok ')]"
+        )
+
+    def test_forgiving_selector_list_specificity(self) -> None:
+        def specificity(css: str) -> tuple[int, int, int]:
+            return parse(css, forgiving=True)[0].specificity()
+
+        # :where() always contributes zero specificity, even when keeping
+        # high-specificity branches.
+        assert specificity(":where(:-moz-x, #keep, .ok)") == (0, 0, 0)
+        assert specificity("div:where(#keep)") == (0, 0, 1)
+        # :is() uses the most specific kept branch only.
+        assert specificity(":is(:-moz-x, #keep, .ok)") == (1, 0, 0)
+        assert specificity("div:is(.a, .b)") == (0, 1, 1)
 
     def test_translation_customization_api(self) -> None:
         # XPathExpr.add_star_prefix() constrains the context to a single

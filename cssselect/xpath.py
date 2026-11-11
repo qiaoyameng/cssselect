@@ -31,8 +31,10 @@ from cssselect.parser import (
     Relation,
     Selector,
     SelectorError,
+    SelectorParseIssue,
     SpecificityAdjustment,
     Tree,
+    argument_source_range,
     ascii_lower,
     parse,
     parse_series,
@@ -211,6 +213,20 @@ class GenericTranslator:
     # class used to represent and xpath expression
     xpathexpr_cls = XPathExpr
 
+    #: When true, the selector lists of ``:is()`` and ``:where()`` are
+    #: parsed as Selectors Level 4 *forgiving selector lists*: an
+    #: unsupported or invalid argument is skipped instead of making the
+    #: whole selector invalid. The top-level selector group, as well as
+    #: the arguments of ``:not()`` and ``:has()``, stay strict in both
+    #: modes.
+    forgiving = False
+
+    #: A list that receives one
+    #: :class:`~cssselect.parser.SelectorParseIssue` for each argument
+    #: skipped by a forgiving selector list, or ``None`` to not collect
+    #: diagnostics. Reset by :meth:`css_to_xpath` on each call.
+    issues: list[SelectorParseIssue] | None = None
+
     def css_to_xpath(self, css: str, prefix: str = "descendant-or-self::") -> str:
         """Translate a *group of selectors* to XPath.
 
@@ -230,9 +246,12 @@ class GenericTranslator:
             The equivalent XPath 1.0 expression as a string.
 
         """
+        issues: list[SelectorParseIssue] | None = [] if self.forgiving else None
+        selectors = parse(css, forgiving=self.forgiving, issues=issues)
+        self.issues = issues
         return " | ".join(
             self.selector_to_xpath(selector, prefix, translate_pseudo_elements=True)
-            for selector in parse(css)
+            for selector in selectors
         )
 
     def selector_to_xpath(
@@ -367,27 +386,56 @@ class GenericTranslator:
 
     def xpath_matching(self, matching: Matching) -> XPathExpr:
         return self._xpath_add_selector_list_condition(
-            self.xpath(matching.selector), matching.selector_list
+            self.xpath(matching.selector),
+            matching.selector_list,
+            matching.forgiving,
         )
 
     def xpath_specificityadjustment(self, matching: SpecificityAdjustment) -> XPathExpr:
         return self._xpath_add_selector_list_condition(
-            self.xpath(matching.selector), matching.selector_list
+            self.xpath(matching.selector),
+            matching.selector_list,
+            matching.forgiving,
         )
 
     def _xpath_add_selector_list_condition(
-        self, xpath: XPathExpr, selector_list: Iterable[Tree]
+        self,
+        xpath: XPathExpr,
+        selector_list: Iterable[Tree],
+        forgiving: bool = False,
     ) -> XPathExpr:
         """Add a condition matching any selector of the list
-        (for :is() and :where())."""
+        (for :is() and :where()).
+
+        For a forgiving selector list an argument that cannot be translated
+        (e.g. an unknown pseudo-class introduced by a browser extension) is
+        skipped. When every argument is skipped a never-matching condition is
+        added, rather than turning the selector into a universal match.
+        """
         conditions: list[str] = []
-        for e in (self.xpath(selector) for selector in selector_list):
+        for selector in selector_list:
+            try:
+                e = self.xpath(selector)
+            except ExpressionError:
+                if not forgiving:
+                    raise
+                self._record_issue(
+                    selector, "The selector cannot be translated to XPath"
+                )
+                continue
             if e.path:
                 # Only a combined selector (e.g. "a b") translates to a path,
                 # which cannot be embedded into a predicate of the outer
                 # expression. The parser rejects combinators in these arguments,
                 # so this is only reachable through a hand-built Matching or
                 # SpecificityAdjustment node.
+                if forgiving:
+                    self._record_issue(
+                        selector,
+                        "Combined selectors are not supported inside "
+                        ":is(), :where() and :matches()",
+                    )
+                    continue
                 raise ExpressionError(
                     "Combined selectors are not supported inside "
                     ":is(), :where() and :matches()"
@@ -398,7 +446,28 @@ class GenericTranslator:
                 # list does too: it adds no condition.
                 return xpath
             conditions.append(e.condition)
+        if not conditions:
+            # No argument survived: the selector list matches nothing, and it
+            # must not silently match every element.
+            return xpath.add_condition("0")
         return xpath.add_condition(_or_conditions(conditions))
+
+    def _record_issue(self, selector: Tree, reason: str) -> None:
+        """Record a forgiving selector list argument dropped at translation."""
+        if self.issues is None:
+            return
+        source_range = argument_source_range(selector)
+        if source_range is None:
+            start = end = -1
+        else:
+            start, end = source_range
+        self.issues.append(
+            SelectorParseIssue(
+                start=start,
+                end=end,
+                reason=f"{reason}: {selector.canonical()}",
+            )
+        )
 
     def xpath_function(self, function: Function) -> XPathExpr:
         """Translate a functional pseudo-class."""

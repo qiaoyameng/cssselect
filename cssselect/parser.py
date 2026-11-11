@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import sys
+import weakref
 from typing import (
     TYPE_CHECKING,
     Literal,
@@ -49,6 +50,40 @@ class SelectorSyntaxError(SelectorError, SyntaxError):
     """Parsing a selector that does not match the grammar."""
 
 
+class SelectorParseIssue:
+    """
+    A diagnostic about a selector list argument that was skipped while
+    parsing a *forgiving selector list* (``:is()`` or ``:where()`` with
+    ``forgiving=True``).
+
+    .. attribute:: start
+
+        The position in the source string of the first token of the
+        skipped argument.
+
+    .. attribute:: end
+
+        The position just past the last token of the skipped argument,
+        so that ``source[start:end]`` is its source text.
+
+    .. attribute:: reason
+
+        The message of the error that made the argument invalid.
+
+    """
+
+    def __init__(self, start: int, end: int, reason: str) -> None:
+        self.start = start
+        self.end = end
+        self.reason = reason
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}"
+            f"(start={self.start}, end={self.end}, reason={self.reason!r})"
+        )
+
+
 #### Parsed objects
 
 Tree: TypeAlias = Union[
@@ -65,6 +100,22 @@ Tree: TypeAlias = Union[
     "CombinedSelector",
 ]
 PseudoElement: TypeAlias = Union["FunctionalPseudoElement", str]
+
+
+# Source ranges (start and end positions in the parsed string) of forgiving
+# selector list arguments, keyed by their parsed tree. The trees themselves
+# stay free of parser bookkeeping, and entries are only ever added while
+# parsing a forgiving list, where a diagnostic may need the range of an
+# argument that only turns out to be unsupported at XPath translation time.
+_argument_ranges: weakref.WeakKeyDictionary[Tree, tuple[int, int]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def argument_source_range(selector: Tree) -> tuple[int, int] | None:
+    """Return the source range of a forgiving selector list argument, or
+    ``None`` if *selector* was not parsed as one."""
+    return _argument_ranges.get(selector)
 
 
 class Selector:
@@ -319,9 +370,14 @@ class Matching:
     Represents selector:is(selector_list)
     """
 
-    def __init__(self, selector: Tree, selector_list: Iterable[Tree]):
+    def __init__(
+        self, selector: Tree, selector_list: Iterable[Tree], forgiving: bool = False
+    ):
         self.selector = selector
         self.selector_list = selector_list
+        #: Whether the list was parsed as a Selectors 4 forgiving selector
+        #: list. Always false for the non-standard :matches() alias.
+        self.forgiving = forgiving
 
     def __repr__(self) -> str:
         args_str = ", ".join(repr(s) for s in self.selector_list)
@@ -339,6 +395,10 @@ class Matching:
 
     def specificity(self) -> tuple[int, int, int]:
         a1, b1, c1 = self.selector.specificity()
+        # A forgiving list whose arguments were all dropped at translation
+        # contributes no specificity.
+        if self.forgiving and not self.selector_list:
+            return a1, b1, c1
         a2, b2, c2 = max(x.specificity() for x in self.selector_list)
         return a1 + a2, b1 + b2, c1 + c2
 
@@ -349,9 +409,16 @@ class SpecificityAdjustment:
     Same as selector:is(selector_list), but its specificity is always 0
     """
 
-    def __init__(self, selector: Tree, selector_list: list[Tree]):
+    def __init__(
+        self,
+        selector: Tree,
+        selector_list: list[Tree],
+        forgiving: bool = False,
+    ):
         self.selector = selector
         self.selector_list = selector_list
+        #: Whether the list was parsed as a Selectors 4 forgiving selector list.
+        self.forgiving = forgiving
 
     def __repr__(self) -> str:
         args_str = ", ".join(repr(s) for s in self.selector_list)
@@ -535,6 +602,53 @@ class CombinedSelector:
 
 #### Parser
 
+
+class ForgivingSelectorList:
+    """Context marking the arguments of a ``:is()`` or ``:where()`` function
+    as a forgiving selector list (Selectors Level 4, §4.1): individual
+    arguments that fail to parse are skipped instead of making the whole
+    selector invalid.
+
+    The current context is looked up on the :class:`TokenStream` so that it
+    reaches nested parser functions without threading it through every call.
+    Entering one while forgiving parsing is disabled (it happens for the
+    strict :matches() alias) is a no-op, which also keeps a nested strict
+    function from borrowing the enclosing list's error recovery. Only
+    ``:is()`` and ``:where()`` push one; ``:not()`` and ``:has()`` never do,
+    since their arguments are not forgiving selector lists.
+
+    ``nesting`` counts the function parentheses opened inside the argument
+    currently being parsed, so error recovery does not stop at a comma or
+    parenthesis belonging to a nested function. It is per-context because
+    forgiving lists can nest.
+    """
+
+    def __init__(
+        self, stream: TokenStream, issues: list[SelectorParseIssue] | None = None
+    ) -> None:
+        self.stream = stream
+        self.issues = issues
+        self.previous: ForgivingSelectorList | None = None
+        self.active = False
+        self.nesting = 0
+
+    def __enter__(self) -> Self:
+        if not self.stream.forgiving_mode:
+            return self
+        self.previous = self.stream.forgiving
+        self.stream.forgiving = self
+        self.active = True
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.active:
+            self.stream.forgiving = self.previous
+
+    def record(self, issue: SelectorParseIssue) -> None:
+        if self.issues is not None:
+            self.issues.append(issue)
+
+
 # foo
 _el_re = re.compile(r"^[ \t\r\n\f]*([a-zA-Z]+)[ \t\r\n\f]*$")
 
@@ -547,7 +661,11 @@ _class_re = re.compile(
 )
 
 
-def parse(css: str) -> list[Selector]:
+def parse(
+    css: str,
+    forgiving: bool = False,
+    issues: list[SelectorParseIssue] | None = None,
+) -> list[Selector]:
     """Parse a CSS *group of selectors*.
 
     If you don't care about pseudo-elements or selector specificity,
@@ -555,6 +673,16 @@ def parse(css: str) -> list[Selector]:
 
     :param css:
         A *group of selectors* as a string.
+    :param forgiving:
+        When true, the selector lists of ``:is()`` and ``:where()`` are
+        parsed as Selectors Level 4 *forgiving selector lists*: an
+        unsupported or invalid argument is skipped instead of making the
+        whole selector invalid. The top-level selector group, as well as
+        the arguments of ``:not()`` and ``:has()``, stay strict in both
+        modes.
+    :param issues:
+        An optional list that receives one :class:`SelectorParseIssue`
+        for each argument skipped by a forgiving selector list.
     :raises:
         :class:`SelectorSyntaxError` on invalid selectors.
     :returns:
@@ -577,7 +705,9 @@ def parse(css: str) -> list[Selector]:
 
     stream = TokenStream(tokenize(css))
     stream.source = css
-    return list(parse_selector_group(stream))
+    if forgiving:
+        stream.forgiving_mode = True
+    return list(parse_selector_group(stream, issues=issues))
 
 
 #    except SelectorSyntaxError:
@@ -589,10 +719,12 @@ def parse(css: str) -> list[Selector]:
 #        raise
 
 
-def parse_selector_group(stream: TokenStream) -> Iterator[Selector]:
+def parse_selector_group(
+    stream: TokenStream, issues: list[SelectorParseIssue] | None = None
+) -> Iterator[Selector]:
     stream.skip_whitespace()
     while 1:
-        yield Selector(*parse_selector(stream))
+        yield Selector(*parse_selector(stream, issues=issues))
         if stream.peek() == ("DELIM", ","):
             stream.next()
             stream.skip_whitespace()
@@ -600,8 +732,10 @@ def parse_selector_group(stream: TokenStream) -> Iterator[Selector]:
             break
 
 
-def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
-    result, pseudo_element = parse_simple_selector(stream)
+def parse_selector(
+    stream: TokenStream, issues: list[SelectorParseIssue] | None = None
+) -> tuple[Tree, PseudoElement | None]:
+    result, pseudo_element = parse_simple_selector(stream, issues=issues)
     while 1:
         stream.skip_whitespace()
         peek = stream.peek()
@@ -619,7 +753,7 @@ def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
             # By exclusion, the last parse_simple_selector() ended
             # at peek == ' '
             combinator = " "
-        next_selector, pseudo_element = parse_simple_selector(stream)
+        next_selector, pseudo_element = parse_simple_selector(stream, issues=issues)
         result = CombinedSelector(result, combinator, next_selector)
     return result, pseudo_element
 
@@ -629,6 +763,7 @@ def parse_simple_selector(
     inside_negation: bool = False,
     inside_selector_list: bool = False,
     inside_relative_selector: bool = False,
+    issues: list[SelectorParseIssue] | None = None,
 ) -> tuple[Tree, PseudoElement | None]:
     stream.skip_whitespace()
     selector_start = len(stream.used)
@@ -692,7 +827,7 @@ def parse_simple_selector(
                 stream.next()
                 pseudo_element = stream.next_ident()
                 if stream.peek() == ("DELIM", "("):
-                    stream.next()
+                    _open_function_paren(stream)
                     pseudo_element = FunctionalPseudoElement(
                         pseudo_element, parse_arguments(stream)
                     )
@@ -720,7 +855,7 @@ def parse_simple_selector(
                         'Got pseudo-class ":scope" not at the start of a selector'
                     )
                 continue
-            stream.next()
+            _open_function_paren(stream)
             stream.skip_whitespace()
             if ident.lower() == "not":
                 if inside_selector_list:
@@ -730,7 +865,7 @@ def parse_simple_selector(
                 if inside_negation:
                     raise SelectorSyntaxError("Got nested :not()")
                 argument, argument_pseudo_element = parse_simple_selector(
-                    stream, inside_negation=True
+                    stream, inside_negation=True, issues=issues
                 )
                 while 1:
                     # Whitespace before the closing parenthesis is not a
@@ -743,6 +878,8 @@ def parse_simple_selector(
                         )
                     if peek == ("DELIM", ")"):
                         stream.next()
+                        if stream.forgiving is not None:
+                            stream.forgiving.nesting -= 1
                         break
                     if peek.is_delim("+", ">", "~"):
                         argument_combinator = cast("str", stream.next().value)
@@ -753,20 +890,30 @@ def parse_simple_selector(
                     else:
                         argument_combinator = " "
                     next_selector, argument_pseudo_element = parse_simple_selector(
-                        stream, inside_negation=True
+                        stream, inside_negation=True, issues=issues
                     )
                     argument = CombinedSelector(
                         argument, argument_combinator, next_selector
                     )
                 result = Negation(result, argument)
             elif ident.lower() == "has":
-                result = Relation(result, parse_relative_selector(stream))
+                result = Relation(result, parse_relative_selector(stream, issues))
             elif ident.lower() in ("matches", "is"):
-                selectors = parse_simple_selector_arguments(stream)
-                result = Matching(result, selectors)
+                # :matches() is a non-standard :is() alias that predates the
+                # Selectors 4 forgiving list, so it stays strictly parsed.
+                forgiving_this_list = stream.forgiving_mode and ident.lower() == "is"
+                original_mode = stream.forgiving_mode
+                stream.forgiving_mode = forgiving_this_list
+                try:
+                    selectors = parse_simple_selector_arguments(stream, issues)
+                finally:
+                    stream.forgiving_mode = original_mode
+                result = Matching(result, selectors, forgiving=forgiving_this_list)
             elif ident.lower() == "where":
-                selectors = parse_simple_selector_arguments(stream)
-                result = SpecificityAdjustment(result, selectors)
+                selectors = parse_simple_selector_arguments(stream, issues)
+                result = SpecificityAdjustment(
+                    result, selectors, forgiving=stream.forgiving_mode
+                )
             else:
                 result = Function(result, ident, parse_arguments(stream))
         else:
@@ -787,12 +934,26 @@ def parse_arguments(stream: TokenStream) -> list[Token]:  # noqa: RET503
         ]:
             arguments.append(next_)
         elif next_ == ("DELIM", ")"):
+            if stream.forgiving is not None:
+                stream.forgiving.nesting -= 1
             return arguments
         else:
             raise SelectorSyntaxError(f"Expected an argument, got {next_}")
 
 
-def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]:
+def _open_function_paren(stream: TokenStream) -> None:
+    """Consume the opening parenthesis of a functional pseudo-class or
+    pseudo-element and, inside a forgiving selector list, count it so that a
+    later error recovery does not stop at a comma or parenthesis belonging to
+    a nested function."""
+    stream.next()
+    if stream.forgiving is not None:
+        stream.forgiving.nesting += 1
+
+
+def parse_relative_selector(
+    stream: TokenStream, issues: list[SelectorParseIssue] | None = None
+) -> list[tuple[Token, Selector]]:
     """Parse the relative selector list of a :has() argument, i.e. a
     comma-separated list of complex selectors, each optionally preceded by a
     combinator."""
@@ -806,7 +967,7 @@ def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]
         else:
             combinator = Token("DELIM", " ", pos=peek.pos)
         result, pseudo_element = parse_simple_selector(
-            stream, inside_relative_selector=True
+            stream, inside_relative_selector=True, issues=issues
         )
         while 1:
             if pseudo_element:
@@ -826,34 +987,120 @@ def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]
                 stream.skip_whitespace()
             else:
                 argument_combinator = " "
-            next_selector, pseudo_element = parse_simple_selector(stream)
+            next_selector, pseudo_element = parse_simple_selector(stream, issues=issues)
             result = CombinedSelector(result, argument_combinator, next_selector)
         arguments.append((combinator, Selector(result)))
         if stream.next().is_delim(")"):
+            if stream.forgiving is not None:
+                stream.forgiving.nesting -= 1
             break
     return arguments
 
 
-def parse_simple_selector_arguments(stream: TokenStream) -> list[Tree]:
-    arguments = []
+def _skip_forgiving_argument(stream: TokenStream) -> tuple[int, int]:
+    """Skip the remaining tokens of a failed forgiving selector list
+    argument, stopping at the comma that ends it or the parenthesis that
+    closes the function (both end up buffered and unconsumed, as in the
+    non-erroring parsing path).
+
+    The parse that just failed may itself have consumed one more token than
+    the argument owns (a comma or closing parenthesis), so such a token is
+    first given back to the stream. Only parenthesis nesting is tracked: a
+    comma or closing parenthesis inside a nested function does not terminate
+    the argument, and strings or attribute values are single tokens whose
+    commas are never split. Returns the source range of the whole argument.
+    """
+    start = stream.argument_start
+    context = stream.forgiving
+    assert context is not None  # only called while parsing a forgiving list
+    last = stream.used[-1]
+    if last.type == "EOF":
+        # An unclosed function makes the whole selector invalid: there is
+        # no boundary at which the malformed argument could end.
+        raise SelectorSyntaxError(f"Expected ')', got {last}")
+    if last.pos >= start and last.is_delim(",", ")") and not context.nesting:
+        # The failed parse already consumed the enclosing list delimiter:
+        # hand it back so the argument loop can read it normally.
+        stream.used.pop()
+        stream.peeked = last
+        stream._peeking = True
+        return start, last.pos
+    nesting = context.nesting
     while 1:
-        result, pseudo_element = parse_simple_selector(
-            stream, inside_selector_list=True
-        )
-        if pseudo_element:
+        try:
+            current = stream.peek()
+        except StopIteration:
+            # The tokenizer stopped without yielding its EOF token, e.g.
+            # after an unclosed string: the whole selector is invalid.
             raise SelectorSyntaxError(
-                f"Got pseudo-element ::{pseudo_element} inside function"
-            )
-        stream.skip_whitespace()
-        next_ = stream.next()
-        if next_ == ("DELIM", ","):
-            stream.skip_whitespace()
-            arguments.append(result)
-        elif next_ == ("DELIM", ")"):
-            arguments.append(result)
+                f"Expected ')', got {EOFToken(stream.used[-1].pos)}"
+            ) from None
+        if current.type == "EOF":
+            raise SelectorSyntaxError(f"Expected ')', got {current}")
+        if current == ("DELIM", "("):
+            nesting += 1
+        elif current == ("DELIM", ")") and nesting:
+            nesting -= 1
+        elif current.is_delim(",", ")") and not nesting:
             break
+        stream.next()
+    context.nesting = 0
+    return start, current.pos
+
+
+def parse_simple_selector_arguments(
+    stream: TokenStream, issues: list[SelectorParseIssue] | None = None
+) -> list[Tree]:
+    forgiving = stream.forgiving_mode
+    arguments: list[Tree] = []
+    while 1:
+        stream.argument_start = stream.peek().pos
+        result: Tree | None = None
+        pseudo_element: PseudoElement | None = None
+        if forgiving:
+            with ForgivingSelectorList(stream, issues) as context:
+                try:
+                    result, pseudo_element = parse_simple_selector(
+                        stream, inside_selector_list=True, issues=issues
+                    )
+                except SelectorSyntaxError as ex:
+                    start, end = _skip_forgiving_argument(stream)
+                    context.record(SelectorParseIssue(start, end, str(ex)))
+                    result = None
+                else:
+                    if pseudo_element is not None:
+                        stream.skip_whitespace()
+                        context.record(
+                            SelectorParseIssue(
+                                stream.argument_start,
+                                stream.peek().pos,
+                                f"Got pseudo-element ::{pseudo_element} inside function",
+                            )
+                        )
+                        result = None
         else:
-            raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+            result, pseudo_element = parse_simple_selector(
+                stream, inside_selector_list=True, issues=issues
+            )
+            if pseudo_element is not None:
+                raise SelectorSyntaxError(
+                    f"Got pseudo-element ::{pseudo_element} inside function"
+                )
+        stream.skip_whitespace()
+        delimiter = stream.next()
+        if delimiter.is_delim(","):
+            stream.skip_whitespace()
+        elif not delimiter.is_delim(")"):
+            raise SelectorSyntaxError(f"Expected an argument, got {delimiter}")
+        if result is not None:
+            if forgiving:
+                _argument_ranges[result] = (
+                    stream.argument_start,
+                    delimiter.pos,
+                )
+            arguments.append(result)
+        if delimiter.is_delim(")"):
+            break
     return arguments
 
 
@@ -1208,6 +1455,13 @@ class TokenStream:
         self.peeked: Token | None = None
         self._peeking = False
         self.next_token = self.tokens.__next__
+        #: Whether parse() was asked for forgiving :is()/:where() lists.
+        self.forgiving_mode = False
+        #: The ForgivingSelectorList currently being parsed, if any.
+        self.forgiving: ForgivingSelectorList | None = None
+        #: Source start position of the argument being parsed by the
+        #: innermost forgiving selector list.
+        self.argument_start = 0
 
     def next(self) -> Token:
         if self._peeking:

@@ -184,6 +184,20 @@ def test_parse_canonical(css: str) -> None:
     check_canonical(selectors)
 
 
+@given(st.text())
+def test_parse_canonical_forgiving(css: str) -> None:
+    try:
+        selectors = parse(css, forgiving=True)
+    except SelectorError:
+        return
+    for selector in selectors:
+        canonical = selector.canonical()
+        reparsed = parse(canonical, forgiving=True)
+        assert len(reparsed) == 1
+        assert reparsed[0].canonical() == canonical
+        assert reparsed[0].specificity() == selector.specificity()
+
+
 @given(st.lists(st.sampled_from(CSS_FRAGMENTS), max_size=20).map("".join))
 def test_css_like(css: str) -> None:
     for translator in (GenericTranslator(), HTMLTranslator()):
@@ -200,6 +214,18 @@ def test_css_like(css: str) -> None:
     except SelectorError:
         return
     check_canonical(selectors)
+
+
+@given(st.lists(st.sampled_from(CSS_FRAGMENTS), max_size=20).map("".join))
+def test_css_like_forgiving(css: str) -> None:
+    for translator in (GenericTranslator(), HTMLTranslator()):
+        translator.forgiving = True
+        try:
+            xpath = translator.css_to_xpath(css)
+        except SelectorError:
+            continue
+        if not any(c in NON_XML_CHARS for c in xpath):
+            etree.XPath(xpath)
 
 
 def check_escape_translates(context: str, char: str) -> None:
