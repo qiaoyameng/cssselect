@@ -9,7 +9,13 @@ from hypothesis import given
 from hypothesis import strategies as st
 from lxml import etree
 
-from cssselect import GenericTranslator, HTMLTranslator, SelectorError, parse
+from cssselect import (
+    GenericTranslator,
+    HTMLTranslator,
+    SelectorError,
+    optimize_selector,
+    parse,
+)
 from cssselect.parser import (
     Token,
     TokenStream,
@@ -200,6 +206,53 @@ def test_css_like(css: str) -> None:
     except SelectorError:
         return
     check_canonical(selectors)
+
+
+_OPTIMIZE_DOCUMENT = etree.fromstring(
+    """
+    <html><body>
+      <div id="d1" class="a b" lang="en">
+        <p id="p1" class="a c">x</p>
+        <p id="p2" class="a"><span id="s1" class="b"/></p>
+      </div>
+      <div id="d2" class="a c" lang="fr"><p id="p3" class="b c"/></div>
+      <div id="d3"><span id="s2" class="a c"/></div>
+      <section id="d4" class="a b"/>
+      <ul id="u1"><li id="l1" class="x"/><li id="l2" class="x"/></ul>
+    </body></html>
+    """
+)
+
+
+@given(st.lists(st.sampled_from(CSS_FRAGMENTS), max_size=20).map("".join))
+def test_optimize_preserves_matches(css: str) -> None:
+    try:
+        selectors = parse(css)
+    except SelectorError:
+        return
+    tree = _OPTIMIZE_DOCUMENT.getroottree()
+    for selector in selectors:
+        snapshot = repr(selector)
+        result = optimize_selector(selector)
+        # The original tree is untouched and specificity is preserved.
+        assert repr(selector) == snapshot
+        assert result.selector.specificity() == selector.specificity()
+        # The canonical form round-trips structurally (its specificity is
+        # the simplified one; the pinned specificity is not serializable).
+        canonical = result.selector.canonical()
+        assert parse(canonical)[0].canonical() == canonical
+        for translator in (GenericTranslator(), HTMLTranslator()):
+            try:
+                before = translator.selector_to_xpath(selector)
+                after = translator.selector_to_xpath(result.selector)
+            except SelectorError:
+                continue
+            if any(c in NON_XML_CHARS for c in before + after):
+                continue
+            before_hits = [tree.getpath(e) for e in _OPTIMIZE_DOCUMENT.xpath(before)]
+            after_hits = [tree.getpath(e) for e in _OPTIMIZE_DOCUMENT.xpath(after)]
+            assert sorted(after_hits) == sorted(before_hits)
+            assert after.count("[") <= before.count("[")
 
 
 def check_escape_translates(context: str, char: str) -> None:

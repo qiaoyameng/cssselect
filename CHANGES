@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Unreleased
+-----------
+
+*   Added :func:`cssselect.optimize_selector`, an optional optimization
+    pass for parsed selectors. It returns a new selector with provably
+    redundant conditions removed (exact duplicates, always-true and
+    always-false selector lists, absorption between a compound selector
+    and its ``:is()``/``:where()``/``:not()``/``:has()`` arguments) plus a
+    record of every simplification, without modifying the original parse
+    tree and without changing the reported specificity. Unknown
+    extensions, namespace bindings and complex relations are left
+    untouched, and an expansion budget bounds the size of intermediate
+    trees.
+
 Version 1.6.0
 -------------
 

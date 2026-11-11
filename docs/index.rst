@@ -61,6 +61,45 @@ is a group of two selectors.
 
 .. autoclass:: HTMLTranslator
 
+Optional selector optimization
+------------------------------
+
+Automatically generated selectors can carry duplicate conditions and
+duplicate ``:is()``/``:where()``/``:has()`` branches, which make the
+generated XPath longer without changing what it matches.
+:func:`optimize_selector` takes a parsed :class:`Selector` and returns a
+new selector with those redundancies removed, along with a record of every
+simplification. The original parse tree is never modified, and the
+reported specificity is always that of the input selector.
+
+.. sourcecode:: pycon
+
+    >>> from cssselect import parse, optimize_selector
+    >>> selector = parse("div.a.a")[0]
+    >>> result = optimize_selector(selector)
+    >>> result.selector.canonical()
+    'div.a'
+    >>> result.records
+    (OptimizationRecord(kind='duplicate-condition', detail='removed duplicate condition(s) .a'),)
+    >>> result.selector.specificity() == selector.specificity()
+    True
+
+Only rewrites whose equivalence is provable from the tree are applied:
+exact duplicate conditions, provably always-true or always-false selector
+lists, and absorption between a compound selector and the functional
+pseudo-classes applying to it. Unknown extensions, different namespace
+bindings, ``:scope``, functional pseudo-classes and ``:has()`` relations
+with explicit combinators are left untouched rather than guessed with.
+The ``max_expansions`` parameter bounds how many list members a rewrite
+may emit, so simplification cannot build exponentially large intermediate
+trees.
+
+.. autofunction:: optimize_selector
+.. autoclass:: OptimizationResult()
+    :members:
+.. autoclass:: OptimizationRecord()
+    :members:
+
 Exceptions
 ----------
 
