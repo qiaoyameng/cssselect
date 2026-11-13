@@ -1,6 +1,17 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+*   Added the optional ``cssselect.optimize`` module: ``optimize()`` and
+    ``optimize_parsed()`` rewrite a parsed selector into a smaller,
+    provably equivalent one (duplicate conditions and ``:is()`` branches,
+    absorption, always-true/always-false rules), returning the optimized
+    tree together with the list of applied simplifications.  The original
+    tree is not modified, and the original specificity is preserved on
+    the result.
+
 Version 1.6.0
 -------------
 

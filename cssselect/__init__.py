@@ -10,6 +10,12 @@ See AUTHORS for more details.
 
 """
 
+from cssselect.optimize import (
+    OptimizationResult,
+    Simplification,
+    optimize,
+    optimize_parsed,
+)
 from cssselect.parser import (
     FunctionalPseudoElement,
     Selector,
@@ -24,9 +30,13 @@ __all__ = (
     "FunctionalPseudoElement",
     "GenericTranslator",
     "HTMLTranslator",
+    "OptimizationResult",
     "Selector",
     "SelectorError",
     "SelectorSyntaxError",
+    "Simplification",
+    "optimize",
+    "optimize_parsed",
     "parse",
 )
 
