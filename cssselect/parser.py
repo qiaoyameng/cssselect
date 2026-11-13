@@ -202,26 +202,64 @@ class Function:
     Represents selector:name(expr)
     """
 
-    def __init__(self, selector: Tree, name: str, arguments: Sequence[Token]) -> None:
+    def __init__(
+        self,
+        selector: Tree,
+        name: str,
+        arguments: Sequence[Token],
+        selector_list: Sequence[Tree] | None = None,
+    ) -> None:
         self.selector = selector
         self.name = ascii_lower(name)
         self.arguments = arguments
+        #: For ``:nth-child()`` and ``:nth-last-child()``, the selector list
+        #: of a Selectors 4 ``of <selector-list>`` argument, as parsed trees.
+        #: ``None`` when the pseudo-class has no ``of`` argument.
+        self.selector_list = selector_list
 
     def __repr__(self) -> str:
         token_values = [token.value for token in self.arguments]
-        return f"{self.__class__.__name__}[{self.selector!r}:{self.name}({token_values!r})]"
+        result = (
+            f"{self.__class__.__name__}[{self.selector!r}:{self.name}({token_values!r})"
+        )
+        if self.selector_list is not None:
+            result += ", of " + repr(list(self.selector_list))
+        return result + "]"
 
     def argument_types(self) -> list[str]:
         return [token.type for token in self.arguments]
 
     def canonical(self) -> str:
         args = "".join(token.css() for token in self.arguments)
-        return f"{self.selector.canonical()}:{_serialize_ident(self.name)}({args})"
+        result = (
+            f"{self.selector.canonical()}:{_serialize_ident(self.name)}({args})"
+        )
+        if self.selector_list is not None:
+            selector_arguments = []
+            for subselector in self.selector_list:
+                selarg = subselector.canonical()
+                if len(selarg) > 1 and selarg[0] == "*" and selarg[1] in "#.[:":
+                    selarg = selarg[1:]
+                selector_arguments.append(selarg)
+            result += " of " + ", ".join(selector_arguments)
+        return result + ")"
 
     def specificity(self) -> tuple[int, int, int]:
-        a, b, c = self.selector.specificity()
-        b += 1
-        return a, b, c
+        if self.selector_list is None:
+            a, b, c = self.selector.specificity()
+            b += 1
+            return a, b, c
+        # Selectors 4: with an "of <selector-list>" argument, the pseudo-class
+        #: replaces its own (0,1,0) contribution with the specificity of
+        #: its most specific argument.
+        return self.selector.specificity() and tuple(
+            x + y
+            for x, y in zip(
+                self.selector.specificity(),
+                max(subselector.specificity() for subselector in self.selector_list),
+                strict=True,
+            )
+        )
 
 
 class Pseudo:
