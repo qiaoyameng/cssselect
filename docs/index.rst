@@ -54,6 +54,8 @@ is a group of two selectors.
 .. autoclass:: Selector()
     :members:
 
+.. autoclass:: DroppedBranch()
+
 .. autoclass:: FunctionalPseudoElement
 
 .. autoclass:: GenericTranslator
@@ -113,6 +115,18 @@ be implemented):
   allowed (e.g. ``:is(a b)`` or ``:is(a > b)``). ``:not()`` and ``:scope`` are
   also rejected inside them, while ``:has()`` is supported (e.g.
   ``:is(:has(> a))``).
+  They also support the Selectors Level 4 *forgiving selector list* behavior
+  through an opt-in mode: call :func:`parse` or
+  :meth:`GenericTranslator.css_to_xpath` with ``forgiving=True`` (or build a
+  translator with ``GenericTranslator(forgiving=True)``). In that mode, an
+  unsupported or invalid branch such as a browser-extension pseudo-class
+  (e.g. ``div:is(:--extension, .ok)``) is ignored instead of making the whole
+  rule fail; if every branch is invalid the pseudo-class never matches rather
+  than becoming a universal selector. ``:where()`` keeps its zero specificity
+  and ``:is()`` only counts the surviving branches. The top-level selector
+  group, ``:not()`` and ``:has()`` are never forgiving. Pass a list as the
+  ``diagnostics`` argument to receive one :class:`DroppedBranch` per rejected
+  branch, with its source range and reason.
 * The ``:has()`` pseudo-class, e.g. ``:has(> a.important, + p b)``. Limitation:
   ``:scope`` is rejected inside it.
 * The ``i`` and ``s`` attribute selector flags, e.g. ``[href^="HTTP" i]``.

@@ -1,6 +1,22 @@
 Changelog
 =========
 
+Unreleased.
+------------
+
+*   Added an opt-in Selectors Level 4 forgiving selector list mode for
+    ``:is()`` and ``:where()`` (and the non-standard ``:matches()`` alias).
+    Pass ``forgiving=True`` to :func:`cssselect.parse` or
+    :meth:`~cssselect.GenericTranslator.css_to_xpath`, or build a
+    ``GenericTranslator(forgiving=True)`` / ``HTMLTranslator(forgiving=True)``.
+    Unsupported or invalid branches of those lists are then skipped instead
+    of invalidating the whole rule; when every branch is rejected the
+    generated condition never matches (``[0]``) rather than degrading into a
+    universal selector. The top-level selector group and the non-forgiving
+    ``:not()`` and ``:has()`` lists keep their strict behavior. An optional
+    ``diagnostics`` list receives :class:`~cssselect.DroppedBranch` objects
+    describing the source range and reason of each rejected branch.
+
 Version 1.6.0
 -------------
 

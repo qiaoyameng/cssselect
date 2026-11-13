@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import sys
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Literal,
@@ -47,6 +48,45 @@ class SelectorError(Exception):
 
 class SelectorSyntaxError(SelectorError, SyntaxError):
     """Parsing a selector that does not match the grammar."""
+
+
+@dataclass(frozen=True)
+class DroppedBranch:
+    """A branch of a forgiving selector list that was rejected.
+
+    Selectors Level 4 defines forgiving selector lists for ``:is()`` and
+    ``:where()``: branches that are unsupported or invalid are ignored
+    instead of making the whole selector invalid.  Instances of this
+    class describe each such ignored branch, and are returned through the
+    optional *diagnostics* argument of :func:`parse` and
+    :meth:`~cssselect.xpath.GenericTranslator.css_to_xpath` when the
+    forgiving mode is enabled.
+
+    .. attribute:: pseudo
+
+        The lower-cased name of the functional pseudo-class holding the
+        list (``"is"`` or ``"where"``).
+
+    .. attribute:: start
+
+        The offset of the first character of the branch in the source
+        string of the whole selector.
+
+    .. attribute:: end
+
+        The offset just past the last character of the branch.
+
+    .. attribute:: reason
+
+        Why the branch was rejected: the message of the underlying
+        :class:`SelectorError`.
+
+    """
+
+    pseudo: str
+    start: int
+    end: int
+    reason: str
 
 
 #### Parsed objects
@@ -319,9 +359,27 @@ class Matching:
     Represents selector:is(selector_list)
     """
 
-    def __init__(self, selector: Tree, selector_list: Iterable[Tree]):
+    def __init__(
+        self,
+        selector: Tree,
+        selector_list: Iterable[Tree],
+        forgiving: bool = False,
+        branch_ranges: Sequence[tuple[int, int]] | None = None,
+        pseudo: str = "is",
+    ):
         self.selector = selector
-        self.selector_list = selector_list
+        self.selector_list = list(selector_list)
+        #: Whether the list was parsed in the Selectors 4 forgiving mode.
+        self.forgiving = forgiving
+        #: Source offsets (start, end) of the list branches, parallel to the
+        #: selector list when it was parsed, including branches that were
+        #: later rejected at translation time.
+        self.branch_ranges: Sequence[tuple[int, int]] = (
+            [] if branch_ranges is None else branch_ranges
+        )
+        #: The functional pseudo-class name (``"is"``, ``"matches"`` or
+        #: ``"where"``), used in forgiving diagnostics.
+        self.pseudo = ascii_lower(pseudo)
 
     def __repr__(self) -> str:
         args_str = ", ".join(repr(s) for s in self.selector_list)
@@ -339,6 +397,10 @@ class Matching:
 
     def specificity(self) -> tuple[int, int, int]:
         a1, b1, c1 = self.selector.specificity()
+        if not self.selector_list:
+            # An all-invalid forgiving list contributes no specificity:
+            # see the :where() rule for empty forgiving selector lists.
+            return a1, b1, c1
         a2, b2, c2 = max(x.specificity() for x in self.selector_list)
         return a1 + a2, b1 + b2, c1 + c2
 
@@ -349,9 +411,26 @@ class SpecificityAdjustment:
     Same as selector:is(selector_list), but its specificity is always 0
     """
 
-    def __init__(self, selector: Tree, selector_list: list[Tree]):
+    def __init__(
+        self,
+        selector: Tree,
+        selector_list: list[Tree],
+        forgiving: bool = False,
+        branch_ranges: Sequence[tuple[int, int]] | None = None,
+        pseudo: str = "where",
+    ):
         self.selector = selector
         self.selector_list = selector_list
+        #: Whether the list was parsed in the Selectors 4 forgiving mode.
+        self.forgiving = forgiving
+        #: Source offsets (start, end) of the list branches, parallel to the
+        #: selector list when it was parsed, including branches that were
+        #: later rejected at translation time.
+        self.branch_ranges: Sequence[tuple[int, int]] = (
+            [] if branch_ranges is None else branch_ranges
+        )
+        #: The functional pseudo-class name, used in forgiving diagnostics.
+        self.pseudo = ascii_lower(pseudo)
 
     def __repr__(self) -> str:
         args_str = ", ".join(repr(s) for s in self.selector_list)
@@ -547,7 +626,11 @@ _class_re = re.compile(
 )
 
 
-def parse(css: str) -> list[Selector]:
+def parse(
+    css: str,
+    forgiving: bool = False,
+    diagnostics: list[DroppedBranch] | None = None,
+) -> list[Selector]:
     """Parse a CSS *group of selectors*.
 
     If you don't care about pseudo-elements or selector specificity,
@@ -555,6 +638,17 @@ def parse(css: str) -> list[Selector]:
 
     :param css:
         A *group of selectors* as a string.
+    :param forgiving:
+        When true, parse the ``:is()`` and ``:where()`` selector lists
+        (and the non-standard ``:matches()`` alias) in the Selectors
+        Level 4 forgiving mode: unsupported or invalid branches of those
+        lists are dropped instead of invalidating the whole selector.
+        The top-level selector group and the non-forgiving ``:not()`` and
+        ``:has()`` lists keep their strict behavior regardless of this
+        option.
+    :param diagnostics:
+        Optional list to which a :class:`DroppedBranch` is appended for
+        every branch rejected in a forgiving list.
     :raises:
         :class:`SelectorSyntaxError` on invalid selectors.
     :returns:
@@ -577,6 +671,8 @@ def parse(css: str) -> list[Selector]:
 
     stream = TokenStream(tokenize(css))
     stream.source = css
+    stream.forgiving = forgiving
+    stream.diagnostics = diagnostics
     return list(parse_selector_group(stream))
 
 
@@ -761,12 +857,33 @@ def parse_simple_selector(
                 result = Negation(result, argument)
             elif ident.lower() == "has":
                 result = Relation(result, parse_relative_selector(stream))
-            elif ident.lower() in ("matches", "is"):
-                selectors = parse_simple_selector_arguments(stream)
-                result = Matching(result, selectors)
-            elif ident.lower() == "where":
-                selectors = parse_simple_selector_arguments(stream)
-                result = SpecificityAdjustment(result, selectors)
+            elif ident.lower() in ("matches", "is", "where"):
+                forgiving_mode = stream.forgiving
+                if forgiving_mode:
+                    selectors, branch_ranges, dropped = (
+                        parse_forgiving_selector_arguments(stream, ident.lower())
+                    )
+                    if stream.diagnostics is not None:
+                        stream.diagnostics.extend(dropped)
+                else:
+                    selectors = parse_simple_selector_arguments(stream)
+                    branch_ranges = None
+                if ident.lower() == "where":
+                    result = SpecificityAdjustment(
+                        result,
+                        selectors,
+                        forgiving=forgiving_mode,
+                        branch_ranges=branch_ranges,
+                        pseudo=ident.lower(),
+                    )
+                else:
+                    result = Matching(
+                        result,
+                        selectors,
+                        forgiving=forgiving_mode,
+                        branch_ranges=branch_ranges,
+                        pseudo=ident.lower(),
+                    )
             else:
                 result = Function(result, ident, parse_arguments(stream))
         else:
@@ -855,6 +972,79 @@ def parse_simple_selector_arguments(stream: TokenStream) -> list[Tree]:
         else:
             raise SelectorSyntaxError(f"Expected an argument, got {next_}")
     return arguments
+
+
+def _split_function_arguments(
+    stream: TokenStream,
+) -> tuple[list[list[Token]], list[tuple[int, int]]]:
+    """Split the arguments of a functional pseudo-class at the top-level
+    commas and consume the closing parenthesis.
+
+    Parenthesis depth is tracked on the token stream, so commas inside
+    nested function arguments, strings or attribute selectors do not split
+    a branch.
+    """
+    branches: list[list[Token]] = []
+    ranges: list[tuple[int, int]] = []
+    current: list[Token] = []
+    start = stream.peek().pos
+    depth = 1
+    while 1:
+        token = stream.next()
+        if token.is_delim("("):
+            depth += 1
+        elif token.is_delim(")"):
+            depth -= 1
+            if depth == 0:
+                branches.append(current)
+                ranges.append((start, token.pos))
+                break
+        if depth == 1 and token.is_delim(","):
+            branches.append(current)
+            ranges.append((start, token.pos))
+            current = []
+            start = token.pos + 1
+        else:
+            current.append(token)
+    return branches, ranges
+
+
+def parse_forgiving_selector_arguments(
+    stream: TokenStream, pseudo: str
+) -> tuple[list[Tree], list[tuple[int, int]], list[DroppedBranch]]:
+    """Parse a forgiving selector list (``:is()``, ``:where()`` and
+    ``:matches()``): each comma-separated branch is parsed on its own and
+    dropped, with a diagnostic, when it is invalid.
+    """
+    branches, ranges = _split_function_arguments(stream)
+    selectors: list[Tree] = []
+    dropped: list[DroppedBranch] = []
+    for tokens, (start, end) in zip(branches, ranges, strict=True):
+        sub_stream = TokenStream(iter([*tokens, EOFToken(end)]), stream.source)
+        sub_stream.forgiving = stream.forgiving
+        sub_stream.diagnostics = stream.diagnostics
+        try:
+            result, pseudo_element = parse_simple_selector(
+                sub_stream, inside_selector_list=True
+            )
+            if pseudo_element:
+                raise SelectorSyntaxError(
+                    f"Got pseudo-element ::{pseudo_element} inside function"
+                )
+            sub_stream.skip_whitespace()
+            if sub_stream.peek().type != "EOF":
+                raise SelectorSyntaxError(
+                    f"Expected an argument, got {sub_stream.peek()}"
+                )
+        except SelectorError as error:
+            dropped.append(
+                DroppedBranch(
+                    pseudo=pseudo, start=start, end=end, reason=str(error)
+                )
+            )
+        else:
+            selectors.append(result)
+    return selectors, ranges, dropped
 
 
 def parse_attrib(selector: Tree, stream: TokenStream) -> Attrib:
@@ -1201,13 +1391,23 @@ def tokenize(s: str) -> Iterator[Token]:
 
 
 class TokenStream:
-    def __init__(self, tokens: Iterable[Token], source: str | None = None) -> None:
+    def __init__(
+        self,
+        tokens: Iterable[Token],
+        source: str | None = None,
+        forgiving: bool = False,
+        diagnostics: list[DroppedBranch] | None = None,
+    ) -> None:
         self.used: list[Token] = []
         self.tokens = iter(tokens)
         self.source = source
         self.peeked: Token | None = None
         self._peeking = False
         self.next_token = self.tokens.__next__
+        # Selectors 4 forgiving list mode, shared by sub-streams that parse
+        # the individual branches of a forgiving selector list.
+        self.forgiving = forgiving
+        self.diagnostics = diagnostics
 
     def next(self) -> Token:
         if self._peeking:

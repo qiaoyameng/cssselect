@@ -26,6 +26,7 @@ import pytest
 from lxml import etree, html
 
 from cssselect import (
+    DroppedBranch,
     ExpressionError,
     GenericTranslator,
     HTMLTranslator,
@@ -2068,6 +2069,191 @@ class TestCssselect(unittest.TestCase):
         assert count(":scope > div") == 1
         assert count(":scope > div > div[class=dialog]") == 1
         assert count(":scope > div div") == 242
+
+    FORGIVING_DOCUMENT = """
+    <root>
+      <div id="d1" class="alpha"/>
+      <div id="d2" class="beta">
+        <span id="s1" class="alpha gamma"/>
+        <b id="b1" title="x,y"/>
+      </div>
+      <p id="p1" class="beta"/>
+      <section id="sec1" class="alpha"/>
+    </root>
+    """
+
+    def test_forgiving_selector_lists_xpath(self) -> None:
+        """Forgiving :is()/:where() keep valid branches and drop the rest."""
+        document = etree.fromstring(self.FORGIVING_DOCUMENT)
+        translator = GenericTranslator()
+
+        def hits(css: str, forgiving: bool = False) -> list[str]:
+            xpath = translator.css_to_xpath(css, forgiving=forgiving)
+            return [
+                element.get("id")
+                for element in typing.cast(
+                    "list[etree._Element]", document.xpath(xpath)
+                )
+            ]
+
+        def equivalent(css: str) -> list[str]:
+            return hits(css)
+
+        # A bad branch at the head, in the middle and at the tail.
+        bad_at_head = "div:is(:--ext, .alpha, #d2)"
+        bad_in_middle = "div:is(.alpha, :--ext, #d2)"
+        bad_at_tail = "div:is(.alpha, #d2, :--ext)"
+        expected = equivalent("div.alpha, div#d2")
+        for css in (bad_at_head, bad_in_middle, bad_at_tail):
+            assert hits(css, forgiving=True) == expected
+
+        # :where(), nested forgiving lists and string/attribute commas.
+        assert hits("*:where(.beta, :--ext)", forgiving=True) == equivalent(
+            "*.beta"
+        )
+        assert hits(
+            ":is(.alpha, :is(.gamma, :--ext))", forgiving=True
+        ) == equivalent(".alpha, .gamma")
+        assert hits(":is([title='x,y'], #p1)", forgiving=True) == equivalent(
+            "[title='x,y'], #p1"
+        )
+        assert hits(':is([title="x,y"], #p1)', forgiving=True) == equivalent(
+            "[title='x,y'], #p1"
+        )
+        # A comma hidden behind an escape is part of the identifier, not a
+        # branch separator.
+        assert hits(r":is(.a\,b, #p1)", forgiving=True) == ["p1"]
+
+        # An all-invalid list never matches, it does not become universal.
+        all_bad_xpath = translator.css_to_xpath(
+            ":is(:--a, :--b)", forgiving=True
+        )
+        assert all_bad_xpath.endswith("[0]")
+        assert hits(":is(:--a, :--b)", forgiving=True) == []
+        where_xpath = translator.css_to_xpath("div:where(:--a)", forgiving=True)
+        assert where_xpath.endswith("[0]")
+
+        # A universal branch still makes the whole list match everything.
+        assert hits("div:is(*, :--ext)", forgiving=True) == equivalent("div")
+
+        # The non-standard :matches() alias is forgiving too.
+        assert hits(":matches(:--ext, .alpha)", forgiving=True) == equivalent(
+            ".alpha"
+        )
+
+    def test_forgiving_diagnostics(self) -> None:
+        """Diagnostics expose the source range and reason of each drop."""
+        translator = GenericTranslator()
+        css = "div:is(.ok, :--ext, #fine)"
+        diagnostics: list[DroppedBranch] = []
+        xpath = translator.css_to_xpath(
+            css, forgiving=True, diagnostics=diagnostics
+        )
+        assert xpath == (
+            "descendant-or-self::div[("
+            "@class and contains(@class, 'ok') and contains("
+            "concat(' ', normalize-space(@class), ' '), ' ok ')) or ("
+            "@id = 'fine')]"
+        )
+        assert diagnostics == [
+            DroppedBranch(
+                pseudo="is",
+                start=11,
+                end=18,
+                reason="Expected ident, got <DELIM '-' at 13>",
+            )
+        ]
+        branch = diagnostics[0]
+        assert css[branch.start : branch.end] == " :--ext"
+
+        # parse() accepts the same diagnostics channel.
+        parse_diagnostics: list[DroppedBranch] = []
+        parsed = parse(
+            ":where(.a, :--bad, .b)",
+            forgiving=True,
+            diagnostics=parse_diagnostics,
+        )
+        assert parsed[0].canonical() == ":where(.a, .b)"
+        assert parse_diagnostics == [
+            DroppedBranch(
+                pseudo="where",
+                start=10,
+                end=17,
+                reason="Expected ident, got <DELIM '-' at 12>",
+            )
+        ]
+
+        # Branches that parse but cannot be translated are dropped too.
+        translation_diagnostics: list[DroppedBranch] = []
+        translator.css_to_xpath(
+            "div:is(.ok, :lorem-ipsum, #fine)",
+            forgiving=True,
+            diagnostics=translation_diagnostics,
+        )
+        assert len(translation_diagnostics) == 1
+        diagnostic = translation_diagnostics[0]
+        assert diagnostic.pseudo == "is"
+        assert diagnostic.reason == "The pseudo-class :lorem-ipsum is unknown"
+
+        # Nested lists report each dropped branch on its own node.
+        nested_diagnostics: list[DroppedBranch] = []
+        translator.css_to_xpath(
+            ":is(.a, :is(:--x, .b), :--y)",
+            forgiving=True,
+            diagnostics=nested_diagnostics,
+        )
+        assert [item.pseudo for item in nested_diagnostics] == ["is", "is"]
+        assert [
+            item.reason.startswith("Expected ident")
+            for item in nested_diagnostics
+        ] == [True, True]
+
+    def test_forgiving_specificity(self) -> None:
+        """:where() stays zero; :is() only counts the surviving branches."""
+
+        def specificity(css: str) -> tuple[int, int, int]:
+            return parse(css, forgiving=True)[0].specificity()
+
+        assert specificity("div:is(.ok, :--x, #fine)") == (1, 0, 1)
+        assert specificity("div:where(.ok, :--x, #fine)") == (0, 0, 1)
+        # An all-invalid :is() contributes no specificity.
+        assert specificity("div:is(:--x, :--y)") == (0, 0, 1)
+        assert specificity("div:where(:--x, :--y)") == (0, 0, 1)
+
+    def test_forgiving_mode_is_opt_in(self) -> None:
+        """Without the mode, and for non-forgiving lists, behavior is strict."""
+        translator = GenericTranslator()
+        bad_is = "div:is(:--ext, .ok)"
+        bad_where = "div:where(:--ext, .ok)"
+
+        # The default parse/translate path is unchanged.
+        with pytest.raises(SelectorSyntaxError):
+            parse(bad_is)
+        with pytest.raises(SelectorSyntaxError):
+            translator.css_to_xpath(bad_is)
+        with pytest.raises(SelectorSyntaxError):
+            translator.css_to_xpath(bad_where)
+
+        # Explicitly disabling the mode on a forgiving translator is strict.
+        forgiving_translator = GenericTranslator(forgiving=True)
+        with pytest.raises(SelectorSyntaxError):
+            forgiving_translator.css_to_xpath(bad_is, forgiving=False)
+
+        # The top-level group is never forgiving.
+        with pytest.raises(SelectorSyntaxError):
+            parse(":--ext, .ok", forgiving=True)
+
+        # :not() and :has() are non-forgiving per Selectors 4, even in the
+        # forgiving mode.
+        with pytest.raises(SelectorSyntaxError):
+            translator.css_to_xpath("div:not(:--ext, .ok)", forgiving=True)
+        with pytest.raises(SelectorSyntaxError):
+            translator.css_to_xpath("div:has(:--ext, .ok)", forgiving=True)
+
+        # HTMLTranslator exposes the same opt-in switch.
+        assert HTMLTranslator(forgiving=True).css_to_xpath(
+            "div:is(:--ext, .ok)"
+        ) == translator.css_to_xpath("div.ok")
 
 
 OPERATOR_PRECEDENCE_IDS = """

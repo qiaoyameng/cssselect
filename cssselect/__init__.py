@@ -11,6 +11,7 @@ See AUTHORS for more details.
 """
 
 from cssselect.parser import (
+    DroppedBranch,
     FunctionalPseudoElement,
     Selector,
     SelectorError,
@@ -20,6 +21,7 @@ from cssselect.parser import (
 from cssselect.xpath import ExpressionError, GenericTranslator, HTMLTranslator
 
 __all__ = (
+    "DroppedBranch",
     "ExpressionError",
     "FunctionalPseudoElement",
     "GenericTranslator",
