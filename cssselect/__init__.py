@@ -15,6 +15,7 @@ from cssselect.parser import (
     Selector,
     SelectorError,
     SelectorSyntaxError,
+    SourceRange,
     parse,
 )
 from cssselect.xpath import ExpressionError, GenericTranslator, HTMLTranslator
@@ -27,6 +28,7 @@ __all__ = (
     "Selector",
     "SelectorError",
     "SelectorSyntaxError",
+    "SourceRange",
     "parse",
 )
 

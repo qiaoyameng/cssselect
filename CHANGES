@@ -1,6 +1,22 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+*   Added optional source tracking: ``parse(css, track_source=True)``
+    sets a ``source_range`` (a half-open range of Python character
+    offsets into the original string) on every parsed object, including
+    combined selectors, attribute selectors, functions and each branch
+    of a selector list, so that tools can highlight the exact part of a
+    rule a node or error is about. ``SelectorError`` exceptions now
+    carry a ``source_range`` too: syntax errors point at the offending
+    token, and translation errors (``ExpressionError``) point at the
+    unsupported structure when it was parsed with tracking enabled
+    (also available as ``css_to_xpath(css, track_source=True)``).
+    Hand-built objects keep ``source_range is None``, and parsing
+    without the option retains no reference to the source string.
+
 Version 1.6.0
 -------------
 

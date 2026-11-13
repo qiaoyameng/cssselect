@@ -18,6 +18,7 @@ import sys
 from typing import (
     TYPE_CHECKING,
     Literal,
+    NamedTuple,
     Protocol,
     Self,
     TypeAlias,
@@ -28,6 +29,20 @@ from typing import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
+
+
+class SourceRange(NamedTuple):
+    """A half-open ``[start, end)`` range of character offsets into the
+    source string a selector was parsed from.
+
+    Offsets are Python string indices (code points), so
+    ``source[start:end]`` always yields exactly the text the node was
+    parsed from, regardless of CSS escapes, comments, CRLF sequences or
+    non-BMP characters in the source.
+    """
+
+    start: int
+    end: int
 
 
 def ascii_lower(string: str) -> str:
@@ -44,9 +59,27 @@ class SelectorError(Exception):
 
     """
 
+    #: The range of source text that caused the error, when known.
+    #: ``None`` when the error is not tied to a parsed source, e.g. for
+    #: hand-built selector objects.
+    source_range: SourceRange | None = None
+
 
 class SelectorSyntaxError(SelectorError, SyntaxError):
     """Parsing a selector that does not match the grammar."""
+
+
+def _syntax_error(message: str, token: Token | None = None) -> SelectorSyntaxError:
+    """Build a syntax error that also points at the source range of
+    *token*, so that editors can highlight the offending text rather
+    than just report a token position."""
+    error = SelectorSyntaxError(message)
+    if token is not None:
+        end = token.end
+        if end is None:
+            end = token.pos + len(token.value or "")
+        error.source_range = SourceRange(token.pos, end)
+    return error
 
 
 #### Parsed objects
@@ -77,6 +110,11 @@ class Selector:
     or unsupported pseudo-elements.
 
     """
+
+    #: Half-open range of the source string this selector was parsed
+    #: from, or ``None`` when parsing did not track source positions
+    #: or the node was built by hand.
+    source_range: SourceRange | None = None
 
     def __init__(self, tree: Tree, pseudo_element: PseudoElement | None = None) -> None:
         self.parsed_tree = tree
@@ -147,6 +185,8 @@ class Class:
     Represents selector.class_name
     """
 
+    source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, class_name: str) -> None:
         self.selector = selector
         self.class_name = class_name
@@ -181,6 +221,8 @@ class FunctionalPseudoElement:
 
     """
 
+    source_range: SourceRange | None = None
+
     def __init__(self, name: str, arguments: Sequence[Token]):
         self.name = ascii_lower(name)
         self.arguments = arguments
@@ -201,6 +243,8 @@ class Function:
     """
     Represents selector:name(expr)
     """
+
+    source_range: SourceRange | None = None
 
     def __init__(self, selector: Tree, name: str, arguments: Sequence[Token]) -> None:
         self.selector = selector
@@ -229,6 +273,8 @@ class Pseudo:
     Represents selector:ident
     """
 
+    source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, ident: str) -> None:
         self.selector = selector
         self.ident = ascii_lower(ident)
@@ -249,6 +295,8 @@ class Negation:
     """
     Represents selector:not(subselector)
     """
+
+    source_range: SourceRange | None = None
 
     def __init__(self, selector: Tree, subselector: Tree) -> None:
         self.selector = selector
@@ -290,6 +338,8 @@ class Relation:
 
     """
 
+    source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, arguments: Sequence[tuple[Token, Selector]]):
         self.selector = selector
         self.arguments = arguments
@@ -318,6 +368,8 @@ class Matching:
     """
     Represents selector:is(selector_list)
     """
+
+    source_range: SourceRange | None = None
 
     def __init__(self, selector: Tree, selector_list: Iterable[Tree]):
         self.selector = selector
@@ -348,6 +400,8 @@ class SpecificityAdjustment:
     Represents selector:where(selector_list)
     Same as selector:is(selector_list), but its specificity is always 0
     """
+
+    source_range: SourceRange | None = None
 
     def __init__(self, selector: Tree, selector_list: list[Tree]):
         self.selector = selector
@@ -380,6 +434,8 @@ class Attrib:
     *flag* is ``'i'`` for a case-insensitive value match, ``'s'`` for a
     case-sensitive one, and `None` when the selector sets neither.
     """
+
+    source_range: SourceRange | None = None
 
     @overload
     def __init__(
@@ -462,6 +518,8 @@ class Element:
 
     """
 
+    source_range: SourceRange | None = None
+
     def __init__(
         self, namespace: str | None = None, element: str | None = None
     ) -> None:
@@ -491,6 +549,8 @@ class Hash:
     Represents selector#id
     """
 
+    source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, id: str) -> None:  # noqa: A002
         self.selector = selector
         self.id = id
@@ -508,6 +568,8 @@ class Hash:
 
 
 class CombinedSelector:
+    source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, combinator: str, subselector: Tree) -> None:
         assert selector is not None
         self.selector = selector
@@ -547,7 +609,7 @@ _class_re = re.compile(
 )
 
 
-def parse(css: str) -> list[Selector]:
+def parse(css: str, *, track_source: bool = False) -> list[Selector]:
     """Parse a CSS *group of selectors*.
 
     If you don't care about pseudo-elements or selector specificity,
@@ -555,6 +617,13 @@ def parse(css: str) -> list[Selector]:
 
     :param css:
         A *group of selectors* as a string.
+    :param track_source:
+        When true, each parsed object gets a
+        :attr:`~Selector.source_range`: a half-open range of character
+        offsets into *css* that the object was parsed from, suitable for
+        highlighting a part of the original string. Objects also keep
+        ``source_range is None`` when this option is off, and no
+        reference to *css* is retained either way.
     :raises:
         :class:`SelectorSyntaxError` on invalid selectors.
     :returns:
@@ -562,21 +631,25 @@ def parse(css: str) -> list[Selector]:
         selector in the comma-separated group.
 
     """
-    # Fast path for simple cases
-    match = _el_re.match(css)
-    if match:
-        return [Selector(Element(element=match.group(1)))]
-    match = _id_re.match(css)
-    if match is not None:
-        return [Selector(Hash(Element(element=match.group(1) or None), match.group(2)))]
-    match = _class_re.match(css)
-    if match is not None:
-        return [
-            Selector(Class(Element(element=match.group(1) or None), match.group(2)))
-        ]
+    if not track_source:
+        # Fast path for simple cases
+        match = _el_re.match(css)
+        if match:
+            return [Selector(Element(element=match.group(1)))]
+        match = _id_re.match(css)
+        if match is not None:
+            return [
+                Selector(Hash(Element(element=match.group(1) or None), match.group(2)))
+            ]
+        match = _class_re.match(css)
+        if match is not None:
+            return [
+                Selector(Class(Element(element=match.group(1) or None), match.group(2)))
+            ]
 
     stream = TokenStream(tokenize(css))
     stream.source = css
+    stream.track_source = track_source
     return list(parse_selector_group(stream))
 
 
@@ -592,12 +665,22 @@ def parse(css: str) -> list[Selector]:
 def parse_selector_group(stream: TokenStream) -> Iterator[Selector]:
     stream.skip_whitespace()
     while 1:
-        yield Selector(*parse_selector(stream))
+        start = stream.mark()
+        selector = Selector(*parse_selector(stream))
+        selector.source_range = stream.source_range_since(start)
+        yield selector
         if stream.peek() == ("DELIM", ","):
             stream.next()
             stream.skip_whitespace()
         else:
             break
+
+
+def _span(left: SourceRange | None, right: SourceRange | None) -> SourceRange | None:
+    """Combine the ranges of two adjacent nodes, if both are known."""
+    if left is None or right is None:
+        return None
+    return SourceRange(left.start, right.end)
 
 
 def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
@@ -620,7 +703,9 @@ def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
             # at peek == ' '
             combinator = " "
         next_selector, pseudo_element = parse_simple_selector(stream)
-        result = CombinedSelector(result, combinator, next_selector)
+        combined = CombinedSelector(result, combinator, next_selector)
+        combined.source_range = _span(result.source_range, next_selector.source_range)
+        result = combined
     return result, pseudo_element
 
 
@@ -632,6 +717,7 @@ def parse_simple_selector(
 ) -> tuple[Tree, PseudoElement | None]:
     stream.skip_whitespace()
     selector_start = len(stream.used)
+    start_pos = stream.mark()
     # Whether the tokens preceding this compound selector (ignoring
     # whitespace) are the start of the input or a comma, for :scope.
     preceding = selector_start - 1
@@ -649,7 +735,7 @@ def parse_simple_selector(
             if peek.type == "IDENT" and namespace == "*":
                 # An escaped "*" (e.g. "\*|f") is a prefix named "*",
                 # not the namespace wildcard, and no XPath prefix can be "*".
-                raise SelectorSyntaxError(f"Expected namespace prefix, got {peek}")
+                raise _syntax_error(f"Expected namespace prefix, got {peek}", peek)
             stream.next()
             element = stream.next_ident_or_star()
         else:
@@ -660,6 +746,10 @@ def parse_simple_selector(
     else:
         element = namespace = None
     result: Tree = Element(namespace, element)
+    if any(token.type != "S" for token in stream.used[selector_start:]):
+        # An element or namespace token was consumed. Otherwise this is
+        # an implicit universal selector, with no source text of its own.
+        result.source_range = stream.source_range_since(start_pos)
     pseudo_element: PseudoElement | None = None
     while 1:
         peek = stream.peek()
@@ -671,22 +761,27 @@ def parse_simple_selector(
             )
         if peek.type == "HASH":
             result = Hash(result, cast("str", stream.next().value))
+            result.source_range = stream.source_range_since(start_pos)
         elif peek == ("DELIM", "."):
             stream.next()
             result = Class(result, stream.next_ident())
+            result.source_range = stream.source_range_since(start_pos)
         elif peek == ("DELIM", "|"):
             # The explicit "no namespace" syntax, e.g. |div: only valid at
             # the very start of a simple selector.
             if len(stream.used) != selector_start:
-                raise SelectorSyntaxError(f"Expected selector, got {peek}")
+                raise _syntax_error(f"Expected selector, got {peek}", peek)
             stream.next()
             element = stream.next_ident_or_star()
             # Unlike *, |* only matches elements with no namespace.
             result = Element("" if element is None else None, element)
+            result.source_range = stream.source_range_since(start_pos)
         elif peek == ("DELIM", "["):
             stream.next()
             result = parse_attrib(result, stream)
+            result.source_range = stream.source_range_since(start_pos)
         elif peek == ("DELIM", ":"):
+            pseudo_pos = stream.mark()
             stream.next()
             if stream.peek() == ("DELIM", ":"):
                 stream.next()
@@ -696,6 +791,7 @@ def parse_simple_selector(
                     pseudo_element = FunctionalPseudoElement(
                         pseudo_element, parse_arguments(stream)
                     )
+                    pseudo_element.source_range = stream.source_range_since(pseudo_pos)
                 continue
             ident = stream.next_ident()
             if ident.lower() in ("first-line", "first-letter", "before", "after"):
@@ -705,6 +801,7 @@ def parse_simple_selector(
                 continue
             if stream.peek() != ("DELIM", "("):
                 result = Pseudo(result, ident)
+                result.source_range = stream.source_range_since(start_pos)
                 # :scope is only supported at the start of a selector,
                 # i.e. never in :is()/:where()/:matches() or :has()
                 # arguments (where a preceding comma separates arguments,
@@ -738,8 +835,9 @@ def parse_simple_selector(
                     stream.skip_whitespace()
                     peek = stream.peek()
                     if argument_pseudo_element:
-                        raise SelectorSyntaxError(
-                            f"Got pseudo-element ::{argument_pseudo_element} inside :not() at {peek.pos}"
+                        raise _syntax_error(
+                            f"Got pseudo-element ::{argument_pseudo_element} inside :not() at {peek.pos}",
+                            peek,
                         )
                     if peek == ("DELIM", ")"):
                         stream.next()
@@ -749,30 +847,39 @@ def parse_simple_selector(
                         stream.skip_whitespace()
                     elif peek.type == "EOF" or peek.is_delim(","):
                         # A selector list is not supported in :not().
-                        raise SelectorSyntaxError(f"Expected ')', got {peek}")
+                        raise _syntax_error(f"Expected ')', got {peek}", peek)
                     else:
                         argument_combinator = " "
                     next_selector, argument_pseudo_element = parse_simple_selector(
                         stream, inside_negation=True
                     )
-                    argument = CombinedSelector(
+                    combined = CombinedSelector(
                         argument, argument_combinator, next_selector
                     )
+                    combined.source_range = _span(
+                        argument.source_range, next_selector.source_range
+                    )
+                    argument = combined
                 result = Negation(result, argument)
+                result.source_range = stream.source_range_since(start_pos)
             elif ident.lower() == "has":
                 result = Relation(result, parse_relative_selector(stream))
+                result.source_range = stream.source_range_since(start_pos)
             elif ident.lower() in ("matches", "is"):
                 selectors = parse_simple_selector_arguments(stream)
                 result = Matching(result, selectors)
+                result.source_range = stream.source_range_since(start_pos)
             elif ident.lower() == "where":
                 selectors = parse_simple_selector_arguments(stream)
                 result = SpecificityAdjustment(result, selectors)
+                result.source_range = stream.source_range_since(start_pos)
             else:
                 result = Function(result, ident, parse_arguments(stream))
+                result.source_range = stream.source_range_since(start_pos)
         else:
-            raise SelectorSyntaxError(f"Expected selector, got {peek}")
+            raise _syntax_error(f"Expected selector, got {peek}", peek)
     if len(stream.used) == selector_start:
-        raise SelectorSyntaxError(f"Expected selector, got {stream.peek()}")
+        raise _syntax_error(f"Expected selector, got {stream.peek()}", stream.peek())
     return result, pseudo_element
 
 
@@ -789,7 +896,7 @@ def parse_arguments(stream: TokenStream) -> list[Token]:  # noqa: RET503
         elif next_ == ("DELIM", ")"):
             return arguments
         else:
-            raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+            raise _syntax_error(f"Expected an argument, got {next_}", next_)
 
 
 def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]:
@@ -799,6 +906,7 @@ def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]
     arguments = []
     while 1:
         stream.skip_whitespace()
+        argument_start = stream.mark()
         peek = stream.peek()
         if peek.is_delim("+", ">", "~"):
             combinator = stream.next()
@@ -820,15 +928,21 @@ def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]
             if peek.is_delim(",", ")"):
                 break
             if peek.type == "EOF":
-                raise SelectorSyntaxError(f"Expected ')', got {peek}")
+                raise _syntax_error(f"Expected ')', got {peek}", peek)
             if peek.is_delim("+", ">", "~"):
                 argument_combinator = cast("str", stream.next().value)
                 stream.skip_whitespace()
             else:
                 argument_combinator = " "
             next_selector, pseudo_element = parse_simple_selector(stream)
-            result = CombinedSelector(result, argument_combinator, next_selector)
-        arguments.append((combinator, Selector(result)))
+            combined = CombinedSelector(result, argument_combinator, next_selector)
+            combined.source_range = _span(
+                result.source_range, next_selector.source_range
+            )
+            result = combined
+        selector = Selector(result)
+        selector.source_range = stream.source_range_since(argument_start)
+        arguments.append((combinator, selector))
         if stream.next().is_delim(")"):
             break
     return arguments
@@ -853,7 +967,7 @@ def parse_simple_selector_arguments(stream: TokenStream) -> list[Tree]:
             arguments.append(result)
             break
         else:
-            raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+            raise _syntax_error(f"Expected an argument, got {next_}", next_)
     return arguments
 
 
@@ -871,7 +985,7 @@ def parse_attrib(selector: Tree, stream: TokenStream) -> Attrib:
     else:
         attrib = stream.next_ident_or_star()
         if attrib is None and stream.peek() != ("DELIM", "|"):
-            raise SelectorSyntaxError(f"Expected '|', got {stream.peek()}")
+            raise _syntax_error(f"Expected '|', got {stream.peek()}", stream.peek())
         if stream.peek() == ("DELIM", "|"):
             stream.next()
             if attrib is not None and stream.peek() == ("DELIM", "="):
@@ -881,8 +995,9 @@ def parse_attrib(selector: Tree, stream: TokenStream) -> Attrib:
             else:
                 if attrib == "*":
                     # An escaped "*" (e.g. "[\*|attr]"), not the wildcard.
-                    raise SelectorSyntaxError(
-                        f"Expected namespace prefix, got {stream.used[-2]}"
+                    raise _syntax_error(
+                        f"Expected namespace prefix, got {stream.used[-2]}",
+                        stream.used[-2],
                     )
                 namespace = "*" if attrib is None else attrib
                 attrib = stream.next_ident()
@@ -902,22 +1017,22 @@ def parse_attrib(selector: Tree, stream: TokenStream) -> Attrib:
             op = cast("str", next_.value) + "="
             stream.next()
         else:
-            raise SelectorSyntaxError(f"Operator expected, got {next_}")
+            raise _syntax_error(f"Operator expected, got {next_}", next_)
     stream.skip_whitespace()
     value = stream.next()
     if value.type not in ("IDENT", "STRING"):
-        raise SelectorSyntaxError(f"Expected string or ident, got {value}")
+        raise _syntax_error(f"Expected string or ident, got {value}", value)
     stream.skip_whitespace()
     next_ = stream.next()
     flag = None
     if next_.type == "IDENT":
         flag = ascii_lower(cast("str", next_.value))
         if flag not in ("i", "s"):
-            raise SelectorSyntaxError(f"Expected ']', got {next_}")
+            raise _syntax_error(f"Expected ']', got {next_}", next_)
         stream.skip_whitespace()
         next_ = stream.next()
     if next_ != ("DELIM", "]"):
-        raise SelectorSyntaxError(f"Expected ']', got {next_}")
+        raise _syntax_error(f"Expected ']', got {next_}", next_)
     return Attrib(selector, namespace, cast("str", attrib), op, value, flag)
 
 
@@ -990,14 +1105,20 @@ class Token(tuple[str, str | None]):  # noqa: SLOT001
         type_: Literal["IDENT", "HASH", "STRING", "S", "DELIM", "NUMBER"],
         value: str,
         pos: int,
+        end: int | None = None,
     ) -> Self: ...
 
     @overload
-    def __new__(cls, type_: Literal["EOF"], value: None, pos: int) -> Self: ...
+    def __new__(
+        cls, type_: Literal["EOF"], value: None, pos: int, end: int | None = None
+    ) -> Self: ...
 
-    def __new__(cls, type_: str, value: str | None, pos: int) -> Self:
+    def __new__(
+        cls, type_: str, value: str | None, pos: int, end: int | None = None
+    ) -> Self:
         obj = tuple.__new__(cls, (type_, value))
         obj.pos = pos
+        obj.end = end
         return obj
 
     def __repr__(self) -> str:
@@ -1007,6 +1128,11 @@ class Token(tuple[str, str | None]):  # noqa: SLOT001
         return self.type == "DELIM" and self.value in values
 
     pos: int
+    #: Offset just past the token in the source string, when produced by
+    #: :func:`tokenize`. Unlike ``pos + len(value)``, this is correct for
+    #: tokens whose source spelling differs from their value, e.g.
+    #: identifiers with escapes. ``None`` for synthesized tokens.
+    end: int | None
 
     @property
     def type(self) -> str:
@@ -1030,7 +1156,7 @@ class Token(tuple[str, str | None]):  # noqa: SLOT001
 
 class EOFToken(Token):
     def __new__(cls, pos: int) -> Self:
-        return Token.__new__(cls, "EOF", None, pos)
+        return Token.__new__(cls, "EOF", None, pos, pos)
 
     def __repr__(self) -> str:
         return f"<{self.type} at {self.pos}>"
@@ -1145,21 +1271,21 @@ def tokenize(s: str) -> Iterator[Token]:
     while pos < len_s:
         match = _match_whitespace(s, pos=pos)
         if match:
-            yield Token("S", " ", pos)
+            yield Token("S", " ", pos, match.end())
             pos = match.end()
             continue
 
         match = _match_ident(s, pos=pos)
         if match:
             value = unescape_ident(match.group())
-            yield Token("IDENT", value, pos)
+            yield Token("IDENT", value, pos, match.end())
             pos = match.end()
             continue
 
         match = _match_hash(s, pos=pos)
         if match:
             value = unescape_ident(match.group()[1:])
-            yield Token("HASH", value, pos)
+            yield Token("HASH", value, pos, match.end())
             pos = match.end()
             continue
 
@@ -1169,18 +1295,22 @@ def tokenize(s: str) -> Iterator[Token]:
             assert match, "Should have found at least an empty match"
             end_pos = match.end()
             if end_pos == len_s:
-                raise SelectorSyntaxError(f"Unclosed string at {pos}")
+                error = _syntax_error(f"Unclosed string at {pos}")
+                error.source_range = SourceRange(pos, len_s)
+                raise error
             if s[end_pos] != quote:
-                raise SelectorSyntaxError(f"Invalid string at {pos}")
+                error = _syntax_error(f"Invalid string at {pos}")
+                error.source_range = SourceRange(pos, end_pos + 1)
+                raise error
             value = _sub_string_escape(_replace_escape, match.group())
-            yield Token("STRING", value, pos)
+            yield Token("STRING", value, pos, end_pos + 1)
             pos = end_pos + 1
             continue
 
         match = _match_number(s, pos=pos)
         if match:
             value = match.group()
-            yield Token("NUMBER", value, pos)
+            yield Token("NUMBER", value, pos, match.end())
             pos = match.end()
             continue
 
@@ -1193,7 +1323,7 @@ def tokenize(s: str) -> Iterator[Token]:
                 pos += 2
             continue
 
-        yield Token("DELIM", s[pos], pos)
+        yield Token("DELIM", s[pos], pos, pos + 1)
         pos += 1
 
     assert pos == len_s
@@ -1205,9 +1335,32 @@ class TokenStream:
         self.used: list[Token] = []
         self.tokens = iter(tokens)
         self.source = source
+        self.track_source = False
         self.peeked: Token | None = None
         self._peeking = False
         self.next_token = self.tokens.__next__
+
+    def mark(self) -> int | None:
+        """Return the offset of the next token, when tracking source.
+
+        Returns ``None`` when source tracking is off, so callers can
+        pass the result straight to :meth:`source_range_since`.
+        """
+        if not self.track_source:
+            return None
+        return self.peek().pos
+
+    def source_range_since(self, start: int | None) -> SourceRange | None:
+        """Return the range from *start* (a :meth:`mark` result) to the
+        end of the last consumed non-whitespace token, or ``None`` when
+        source tracking is off."""
+        if start is None:
+            return None
+        for token in reversed(self.used):
+            if token.type != "S":
+                assert token.end is not None
+                return SourceRange(start, token.end)
+        return None
 
     def next(self) -> Token:
         if self._peeking:
@@ -1229,7 +1382,7 @@ class TokenStream:
     def next_ident(self) -> str:
         next_ = self.next()
         if next_.type != "IDENT":
-            raise SelectorSyntaxError(f"Expected ident, got {next_}")
+            raise _syntax_error(f"Expected ident, got {next_}", next_)
         return cast("str", next_.value)
 
     def next_ident_or_star(self) -> str | None:
@@ -1238,7 +1391,7 @@ class TokenStream:
             return next_.value
         if next_ == ("DELIM", "*"):
             return None
-        raise SelectorSyntaxError(f"Expected ident or '*', got {next_}")
+        raise _syntax_error(f"Expected ident or '*', got {next_}", next_)
 
     def skip_whitespace(self) -> None:
         # A comment between two whitespace runs yields two consecutive

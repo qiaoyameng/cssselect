@@ -46,6 +46,17 @@ class ExpressionError(SelectorError, RuntimeError):
     """Unknown or unsupported selector (eg. pseudo-class)."""
 
 
+def _expression_error(message: str, node: object = None) -> ExpressionError:
+    """Build an error that also carries the source range of the parsed
+    node it is about, when that node was parsed with source tracking,
+    so that the offending part of the original selector can be
+    highlighted. The message stays a human-readable reason either way.
+    """
+    error = ExpressionError(message)
+    error.source_range = getattr(node, "source_range", None)
+    return error
+
+
 #### XPath Helpers
 
 
@@ -211,7 +222,12 @@ class GenericTranslator:
     # class used to represent and xpath expression
     xpathexpr_cls = XPathExpr
 
-    def css_to_xpath(self, css: str, prefix: str = "descendant-or-self::") -> str:
+    def css_to_xpath(
+        self,
+        css: str,
+        prefix: str = "descendant-or-self::",
+        track_source: bool = False,
+    ) -> str:
         """Translate a *group of selectors* to XPath.
 
         Pseudo-elements are not supported here since XPath only knows
@@ -222,6 +238,10 @@ class GenericTranslator:
         :param prefix:
             This string is prepended to the XPath expression for each selector.
             The default makes selectors scoped to the context node’s subtree.
+        :param track_source:
+            When true, parse with source tracking so that a raised
+            :class:`ExpressionError` points at the range of *css* that
+            caused it (see :func:`cssselect.parse`).
         :raises:
             :class:`~cssselect.SelectorSyntaxError` on invalid selectors,
             :class:`ExpressionError` on unknown/unsupported selectors,
@@ -232,7 +252,7 @@ class GenericTranslator:
         """
         return " | ".join(
             self.selector_to_xpath(selector, prefix, translate_pseudo_elements=True)
-            for selector in parse(css)
+            for selector in parse(css, track_source=track_source)
         )
 
     def selector_to_xpath(
@@ -279,7 +299,7 @@ class GenericTranslator:
         but can be overridden by sub-classes.
 
         """
-        raise ExpressionError("Pseudo-elements are not supported.")
+        raise _expression_error("Pseudo-elements are not supported.", pseudo_element)
 
     @staticmethod
     def xpath_literal(s: str) -> str:
@@ -305,7 +325,7 @@ class GenericTranslator:
             getattr(self, f"xpath_{type_name.lower()}", None),
         )
         if method is None:
-            raise ExpressionError(f"{type_name} is not supported.")
+            raise _expression_error(f"{type_name} is not supported.", parsed_selector)
         return method(parsed_selector)
 
     # Dispatched by parsed object type
@@ -381,16 +401,18 @@ class GenericTranslator:
         """Add a condition matching any selector of the list
         (for :is() and :where())."""
         conditions: list[str] = []
-        for e in (self.xpath(selector) for selector in selector_list):
+        for selector in selector_list:
+            e = self.xpath(selector)
             if e.path:
                 # Only a combined selector (e.g. "a b") translates to a path,
                 # which cannot be embedded into a predicate of the outer
                 # expression. The parser rejects combinators in these arguments,
                 # so this is only reachable through a hand-built Matching or
                 # SpecificityAdjustment node.
-                raise ExpressionError(
+                raise _expression_error(
                     "Combined selectors are not supported inside "
-                    ":is(), :where() and :matches()"
+                    ":is(), :where() and :matches()",
+                    selector,
                 )
             e.add_name_test()
             if not e.condition:
@@ -408,7 +430,9 @@ class GenericTranslator:
             getattr(self, method_name, None),
         )
         if not method:
-            raise ExpressionError(f"The pseudo-class :{function.name}() is unknown")
+            raise _expression_error(
+                f"The pseudo-class :{function.name}() is unknown", function
+            )
         return method(self.xpath(function.selector), function)
 
     def xpath_pseudo(self, pseudo: Pseudo) -> XPathExpr:
@@ -419,7 +443,9 @@ class GenericTranslator:
             getattr(self, method_name, None),
         )
         if not method:
-            raise ExpressionError(f"The pseudo-class :{pseudo.ident} is unknown")
+            raise _expression_error(
+                f"The pseudo-class :{pseudo.ident} is unknown", pseudo
+            )
         return method(self.xpath(pseudo.selector))
 
     def xpath_attrib(self, selector: Attrib) -> XPathExpr:
@@ -589,7 +615,9 @@ class GenericTranslator:
         try:
             a, b = parse_series(function.arguments)
         except ValueError as ex:
-            raise ExpressionError(f"Invalid series: '{function.arguments!r}'") from ex
+            raise _expression_error(
+                f"Invalid series: '{function.arguments!r}'", function
+            ) from ex
 
         # From https://www.w3.org/TR/css3-selectors/#structural-pseudos:
         #
@@ -725,7 +753,9 @@ class GenericTranslator:
         return self.xpath_nth_child_function(xpath, function, last=True)
 
     @staticmethod
-    def _check_of_type_element(xpath: XPathExpr, pseudo: str) -> None:
+    def _check_of_type_element(
+        xpath: XPathExpr, pseudo: str, node: Function | None = None
+    ) -> None:
         """Raise an exception if an -of-type pseudo-class can't be used with
         the given element.
 
@@ -736,18 +766,18 @@ class GenericTranslator:
         element = xpath.element
         if element == "*" or element.endswith(":*"):
             css_element = element.replace(":", "|")
-            raise ExpressionError(f"{css_element}:{pseudo} is not implemented")
+            raise _expression_error(f"{css_element}:{pseudo} is not implemented", node)
 
     def xpath_nth_of_type_function(
         self, xpath: XPathExpr, function: Function
     ) -> XPathExpr:
-        self._check_of_type_element(xpath, "nth-of-type()")
+        self._check_of_type_element(xpath, "nth-of-type()", function)
         return self.xpath_nth_child_function(xpath, function, add_name_test=False)
 
     def xpath_nth_last_of_type_function(
         self, xpath: XPathExpr, function: Function
     ) -> XPathExpr:
-        self._check_of_type_element(xpath, "nth-last-of-type()")
+        self._check_of_type_element(xpath, "nth-last-of-type()", function)
         return self.xpath_nth_child_function(
             xpath, function, last=True, add_name_test=False
         )
@@ -758,16 +788,18 @@ class GenericTranslator:
         # Defined there, removed in later drafts:
         # http://www.w3.org/TR/2001/CR-css3-selectors-20011113/#content-selectors
         if function.argument_types() not in (["STRING"], ["IDENT"]):
-            raise ExpressionError(
-                f"Expected a single string or ident for :contains(), got {function.arguments!r}"
+            raise _expression_error(
+                f"Expected a single string or ident for :contains(), got {function.arguments!r}",
+                function,
             )
         value = cast("str", function.arguments[0].value)
         return xpath.add_condition(f"contains(., {self.xpath_literal(value)})")
 
     def xpath_lang_function(self, xpath: XPathExpr, function: Function) -> XPathExpr:
         if function.argument_types() not in (["STRING"], ["IDENT"]):
-            raise ExpressionError(
-                f"Expected a single string or ident for :lang(), got {function.arguments!r}"
+            raise _expression_error(
+                f"Expected a single string or ident for :lang(), got {function.arguments!r}",
+                function,
             )
         value = cast("str", function.arguments[0].value)
         return xpath.add_condition(f"lang({self.xpath_literal(value)})")
@@ -956,8 +988,9 @@ class HTMLTranslator(GenericTranslator):
 
     def xpath_lang_function(self, xpath: XPathExpr, function: Function) -> XPathExpr:
         if function.argument_types() not in (["STRING"], ["IDENT"]):
-            raise ExpressionError(
-                f"Expected a single string or ident for :lang(), got {function.arguments!r}"
+            raise _expression_error(
+                f"Expected a single string or ident for :lang(), got {function.arguments!r}",
+                function,
             )
         value = cast("str", function.arguments[0].value)
         # Language-range matching is ASCII case-insensitive (RFC 4647),

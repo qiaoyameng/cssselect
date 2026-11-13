@@ -33,10 +33,20 @@ from cssselect import (
     parse,
 )
 from cssselect.parser import (
+    Attrib,
+    Class,
+    CombinedSelector,
+    Element,
     Function,
     FunctionalPseudoElement,
+    Hash,
     Matching,
+    Negation,
+    Pseudo,
     PseudoElement,
+    Relation,
+    Selector,
+    SpecificityAdjustment,
     Token,
     parse_series,
     tokenize,
@@ -45,7 +55,7 @@ from cssselect.parser import (
 from cssselect.xpath import XPathExpr
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
 
 class TestCssselect(unittest.TestCase):
@@ -699,6 +709,224 @@ class TestCssselect(unittest.TestCase):
         assert get_error(":has(.a )") is None
         assert get_error(":has(a b)") is None
         assert get_error(":has(a, b)") is None
+
+    @staticmethod
+    def _walk_source_tree(
+        node: object, parent: object | None = None
+    ) -> Iterator[tuple[object, object | None]]:
+        """Yield a parsed object and its children, depth-first."""
+        yield node, parent
+        children: list[object] = []
+        selector = getattr(node, "selector", None)
+        if selector is not None:
+            children.append(selector)
+        if isinstance(node, Selector):
+            children.append(node.parsed_tree)
+        if isinstance(node, (CombinedSelector, Negation)):
+            children.append(node.subselector)
+        if isinstance(node, (Matching, SpecificityAdjustment)):
+            children.extend(node.selector_list)
+        if isinstance(node, Relation):
+            children.extend(argument for _, argument in node.arguments)
+        for child in children:
+            yield from TestCssselect._walk_source_tree(child, node)
+
+    def test_source_ranges(self) -> None:
+        def source_slices(css: str) -> list[tuple[str, str | None]]:
+            return [
+                (
+                    type(node).__name__,
+                    None
+                    if node.source_range is None
+                    else css[node.source_range.start : node.source_range.end],
+                )
+                for selector in parse(css, track_source=True)
+                for node, _ in self._walk_source_tree(selector)
+            ]
+
+        # Escaped identifiers, an attribute flag, nested functions, a
+        # comment and a trailing CRLF.
+        css = (
+            r".cl\41 ss > #x:not([href^='a' i]):nth-child(2n+1)"
+            ", /* c */ div:has(> span.f)\r\n"
+        )
+        whole_first = r".cl\41 ss > #x:not([href^='a' i]):nth-child(2n+1)"
+        assert source_slices(css) == [
+            ("Selector", whole_first),
+            ("CombinedSelector", whole_first),
+            ("Class", r".cl\41 ss"),
+            # An implicit universal selector has no source of its own.
+            ("Element", None),
+            ("Function", "#x:not([href^='a' i]):nth-child(2n+1)"),
+            ("Negation", "#x:not([href^='a' i])"),
+            ("Hash", "#x"),
+            ("Element", None),
+            ("Attrib", "[href^='a' i]"),
+            ("Element", None),
+            ("Selector", "div:has(> span.f)"),
+            ("Relation", "div:has(> span.f)"),
+            ("Element", "div"),
+            # A :has() argument branch includes its leading combinator.
+            ("Selector", "> span.f"),
+            ("Class", "span.f"),
+            ("Element", "span"),
+        ]
+
+        # Nested list arguments, escapes and a non-BMP character: ranges
+        # are Python character offsets into the original string.
+        css = "a:is(.\\31 x, 😀:where(em, strong#i\\:d)):nth-last-child( +2n - 1 )"
+        assert source_slices(css) == [
+            ("Selector", css),
+            ("Function", css),
+            ("Matching", "a:is(.\\31 x, 😀:where(em, strong#i\\:d))"),
+            ("Element", "a"),
+            ("Class", ".\\31 x"),
+            ("Element", None),
+            ("SpecificityAdjustment", "😀:where(em, strong#i\\:d)"),
+            ("Element", "😀"),
+            ("Element", "em"),
+            ("Hash", "strong#i\\:d"),
+            ("Element", "strong"),
+        ]
+
+        # Comments and CRLF between tokens do not shift offsets, and
+        # trailing whitespace is not part of a selector branch.
+        css = " e#f\\:g:hover /*x*/ ,\r\n|div::before "
+        assert source_slices(css) == [
+            ("Selector", "e#f\\:g:hover"),
+            ("Pseudo", "e#f\\:g:hover"),
+            ("Hash", "e#f\\:g"),
+            ("Element", "e"),
+            ("Selector", "|div::before"),
+            ("Element", "|div"),
+        ]
+
+        # A functional pseudo-element gets its own range.
+        css = "p::marker(1)"
+        (selector,) = parse(css, track_source=True)
+        pseudo_element = selector.pseudo_element
+        assert isinstance(pseudo_element, FunctionalPseudoElement)
+        assert pseudo_element.source_range is not None
+        start, end = pseudo_element.source_range
+        assert css[start:end] == "::marker(1)"
+
+    def test_source_ranges_consistency(self) -> None:
+        rules = [
+            r".cl\41 ss > #x:not([href^='a' i]):nth-child(2n+1)",
+            "a:is(.\\31 x, 😀:where(em, strong#i\\:d)):nth-last-child( +2n - 1 )",
+            " e#f\\:g:hover /*x*/ ,\r\n|div::before ",
+            "div:has(> span.f, ~ em)\r\n",
+            "p::marker(1)",
+        ]
+        for css in rules:
+            tracked = parse(css, track_source=True)
+            plain = parse(css)
+            # Tracking must not change the parse result.
+            assert [s.canonical() for s in tracked] == [
+                s.canonical() for s in plain
+            ]
+            assert [s.specificity() for s in tracked] == [
+                s.specificity() for s in plain
+            ]
+            for node, parent in (
+                pair
+                for selector in tracked
+                for pair in self._walk_source_tree(selector)
+            ):
+                source_range = node.source_range
+                if source_range is None:
+                    continue
+                # Half-open ranges of Python character offsets.
+                assert 0 <= source_range.start < source_range.end <= len(css)
+                # A node's range is contained in its parent's.
+                if parent is not None and parent.source_range is not None:
+                    assert source_range.start >= parent.source_range.start
+                    assert source_range.end <= parent.source_range.end
+            # Without the option, nothing is tracked...
+            for selector in plain:
+                for node, _ in self._walk_source_tree(selector):
+                    assert node.source_range is None
+            # ... and the result holds no reference to the source string.
+            stack: list[object] = list(plain)
+            seen: set[int] = set()
+            while stack:
+                obj = stack.pop()
+                if id(obj) in seen:
+                    continue
+                seen.add(id(obj))
+                assert obj is not css
+                if hasattr(obj, "__dict__"):
+                    stack.extend(vars(obj).values())
+                if isinstance(obj, (list, tuple)):
+                    stack.extend(obj)
+
+        # Hand-built nodes are explicitly marked as having no source.
+        for node in (
+            Selector(Element("div")),
+            Element("div"),
+            Hash(Element(), "x"),
+            Class(Element(), "x"),
+            Pseudo(Element(), "hover"),
+            Attrib(Element(), None, "href", "exists", None),
+            Function(Element(), "nth-child", [Token("NUMBER", "2", 0)]),
+            CombinedSelector(Element("a"), " ", Element("b")),
+        ):
+            assert node.source_range is None
+
+    def test_source_range_errors(self) -> None:
+        # A translation error points at the offending branch only, not
+        # at the whole rule.
+        css = "a, x > y:wat(2)"
+        with pytest.raises(ExpressionError) as excinfo:
+            GenericTranslator().css_to_xpath(css, track_source=True)
+        error = excinfo.value
+        assert str(error) == "The pseudo-class :wat() is unknown"
+        assert error.source_range is not None
+        assert css[error.source_range.start : error.source_range.end] == "y:wat(2)"
+
+        css = "div, span:past"
+        with pytest.raises(ExpressionError) as excinfo:
+            GenericTranslator().css_to_xpath(css, track_source=True)
+        error = excinfo.value
+        assert str(error) == "The pseudo-class :past is unknown"
+        assert error.source_range is not None
+        assert css[error.source_range.start : error.source_range.end] == "span:past"
+
+        css = "em, *:nth-of-type(2)"
+        with pytest.raises(ExpressionError) as excinfo:
+            GenericTranslator().css_to_xpath(css, track_source=True)
+        error = excinfo.value
+        assert error.source_range is not None
+        assert (
+            css[error.source_range.start : error.source_range.end]
+            == "*:nth-of-type(2)"
+        )
+
+        css = "li:nth-child(2x)"
+        with pytest.raises(ExpressionError) as excinfo:
+            GenericTranslator().css_to_xpath(css, track_source=True)
+        error = excinfo.value
+        assert "Invalid series" in str(error)
+        assert error.source_range is not None
+        assert css[error.source_range.start : error.source_range.end] == css
+
+        # A syntax error points at the offending token.
+        css = "ul li, dd ]"
+        with pytest.raises(SelectorSyntaxError) as excinfo:
+            parse(css, track_source=True)
+        error = excinfo.value
+        assert error.source_range is not None
+        assert css[error.source_range.start : error.source_range.end] == "]"
+
+        # Without source tracking, translation errors have no range...
+        with pytest.raises(ExpressionError) as excinfo:
+            GenericTranslator().css_to_xpath("a:wat")
+        assert excinfo.value.source_range is None
+
+        # ... and neither do errors about hand-built nodes.
+        with pytest.raises(ExpressionError) as excinfo:
+            GenericTranslator().selector_to_xpath(Selector(Pseudo(Element(), "wat")))
+        assert excinfo.value.source_range is None
 
     def test_translation(self) -> None:
         def xpath(css: str) -> str:
