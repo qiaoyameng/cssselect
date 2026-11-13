@@ -1,6 +1,15 @@
 Changelog
 =========
 
+Unreleased.
+-----------
+
+*   ``:lang()`` now accepts a comma-separated list of RFC 4647 extended
+    language ranges, including wildcard subtags such as ``"*-Latn"`` and
+    ``"de-*-DE"``. Matching uses the inherited ``lang`` or ``xml:lang``
+    attribute, respects empty local overrides, and is ASCII
+    case-insensitive.
+
 Version 1.6.0
 -------------
 

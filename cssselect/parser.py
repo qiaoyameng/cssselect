@@ -215,7 +215,10 @@ class Function:
         return [token.type for token in self.arguments]
 
     def canonical(self) -> str:
-        args = "".join(token.css() for token in self.arguments)
+        if self.name == "lang":
+            args = ", ".join(token.css() for token in self.arguments)
+        else:
+            args = "".join(token.css() for token in self.arguments)
         return f"{self.selector.canonical()}:{_serialize_ident(self.name)}({args})"
 
     def specificity(self) -> tuple[int, int, int]:
@@ -767,6 +770,8 @@ def parse_simple_selector(
             elif ident.lower() == "where":
                 selectors = parse_simple_selector_arguments(stream)
                 result = SpecificityAdjustment(result, selectors)
+            elif ident.lower() == "lang":
+                result = Function(result, ident, parse_lang_arguments(stream))
             else:
                 result = Function(result, ident, parse_arguments(stream))
         else:
@@ -790,6 +795,106 @@ def parse_arguments(stream: TokenStream) -> list[Token]:  # noqa: RET503
             return arguments
         else:
             raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+
+
+_language_range_first_subtag = re.compile("[a-z]{1,8}").fullmatch
+_language_range_subtag = re.compile("[a-z0-9]{1,8}").fullmatch
+
+
+def _check_language_range(value: str, start: int) -> None:
+    """Validate an RFC 4647 extended language range.
+
+    *start* is the position of the first character of *value* in the
+    selector, so that a syntax error points at the invalid character.
+    """
+    if not value:
+        # The empty language range is meaningful: it matches untagged
+        # elements.
+        return
+    offset = 0
+    for index, subtag in enumerate(value.split("-")):
+        if not subtag:
+            invalid = offset if offset < len(value) else len(value) - 1
+            raise SelectorSyntaxError(
+                f"Invalid language range {value!r} at {start + invalid}"
+            )
+        if subtag != "*":
+            matcher = (
+                _language_range_first_subtag
+                if index == 0
+                else _language_range_subtag
+            )
+            if not matcher(ascii_lower(subtag)):
+                invalid = next(
+                    (
+                        position
+                        for position, char in enumerate(subtag)
+                        if char == "*"
+                        or not (
+                            "a" <= ascii_lower(char) <= "z"
+                            or (index != 0 and "0" <= char <= "9")
+                        )
+                    ),
+                    min(len(subtag) - 1, 8),
+                )
+                raise SelectorSyntaxError(
+                    f"Invalid language range {value!r} at {start + offset + invalid}"
+                )
+        offset += len(subtag) + 1
+
+
+def parse_lang_arguments(stream: TokenStream) -> list[Token]:
+    """Parse and validate the comma-separated language ranges of ``:lang()``.
+
+    Each range is kept as a single token. Unquoted ranges that contain
+    wildcards are tokenized as several tokens, and are combined into one
+    synthetic string token here.
+    """
+    arguments: list[Token] = []
+    while 1:
+        stream.skip_whitespace()
+        first = stream.next()
+        if first.type == "EOF" or first == ("DELIM", ")"):
+            raise SelectorSyntaxError(f"Expected an argument, got {first}")
+
+        if first.type == "STRING":
+            value = cast("str", first.value)
+            start = first.pos + 1
+            range_token = first
+        elif first.type == "IDENT" or first == ("DELIM", "*"):
+            pieces = [cast("str", first.value)]
+            while 1:
+                peek = stream.peek()
+                if (
+                    peek.type in ("S", "EOF")
+                    or peek.is_delim(",", ")")
+                    or not (peek.type == "IDENT" or peek.type == "DELIM")
+                ):
+                    break
+                pieces.append(cast("str", stream.next().value))
+            value = "".join(pieces)
+            start = first.pos
+            if len(pieces) == 1 and first.type == "IDENT":
+                range_token = first
+            else:
+                # A synthetic string token keeps wildcards and odd characters
+                # representable by Function.canonical().
+                range_token = Token("STRING", value, first.pos)
+        else:
+            raise SelectorSyntaxError(f"Expected an argument, got {first}")
+
+        _check_language_range(value, start)
+        arguments.append(range_token)
+
+        stream.skip_whitespace()
+        separator = stream.next()
+        if separator == ("DELIM", ")"):
+            return arguments
+        if separator == ("DELIM", ","):
+            continue
+        if separator.type == "EOF":
+            raise SelectorSyntaxError(f"Expected an argument, got {separator}")
+        raise SelectorSyntaxError(f"Expected ')' or ',', got {separator}")
 
 
 def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]:

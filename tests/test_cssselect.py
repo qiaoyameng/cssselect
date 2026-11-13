@@ -160,6 +160,9 @@ class TestCssselect(unittest.TestCase):
         ]
         assert parse_many("label:only") == ["Pseudo[Element[label]:only]"]
         assert parse_many("a:lang(fr)") == ["Function[Element[a]:lang(['fr'])]"]
+        assert parse_many('a:lang(en, "zh-Hans", "*-Latn")') == [
+            "Function[Element[a]:lang(['en', 'zh-Hans', '*-Latn'])]"
+        ]
         assert parse_many('div:contains("foo")') == [
             "Function[Element[div]:contains(['foo'])]"
         ]
@@ -573,7 +576,24 @@ class TestCssselect(unittest.TestCase):
             "Expected ']', got <IDENT 's' at 18>"
         )
         assert get_error(":lang(fr)") is None
+        assert get_error(":lang(fr, en)") is None
+        assert get_error(':lang("*-Latn")') is None
         assert get_error(":lang(fr") == ("Expected an argument, got <EOF at 8>")
+        assert get_error(":lang(en--US)") == (
+            "Invalid language range 'en--US' at 9"
+        )
+        assert get_error(":lang(en-)") == (
+            "Invalid language range 'en-' at 8"
+        )
+        assert get_error(':lang("419")') == (
+            "Invalid language range '419' at 7"
+        )
+        assert get_error(":lang(abcdefghi)") == (
+            "Invalid language range 'abcdefghi' at 14"
+        )
+        assert get_error(":lang(en-*foo)") == (
+            "Invalid language range 'en-*foo' at 9"
+        )
         assert get_error(':contains("foo') == ("Unclosed string at 10")
         # A raw newline terminates the string match without closing it.
         assert get_error('[a="b\nc"]') == ("Invalid string at 3")
@@ -1067,7 +1087,9 @@ class TestCssselect(unittest.TestCase):
             xpath("::lorem-ipsum")
         with pytest.raises(ExpressionError, match=r":contains\(\)"):
             xpath(":contains(1)")
-        with pytest.raises(ExpressionError, match=r":lang\(\)"):
+        with pytest.raises(
+            SelectorSyntaxError, match=r"Expected an argument, got <NUMBER '1'"
+        ):
             xpath(":lang(1)")
         with pytest.raises(TypeError):
             GenericTranslator().css_to_xpath(4)  # type: ignore[arg-type]
@@ -1416,8 +1438,10 @@ class TestCssselect(unittest.TestCase):
         ]
         assert langid(":lang(es)") == []
 
-        # The HTML translator requires a string or ident argument too.
-        with pytest.raises(ExpressionError, match=r":lang\(\)"):
+        # Language ranges are parsed and validated as part of the selector.
+        with pytest.raises(
+            SelectorSyntaxError, match=r"Expected an argument, got <NUMBER '1'"
+        ):
             HTMLTranslator().css_to_xpath(":lang(1)")
         # Selectors 4: :lang("") matches (only) elements whose language is
         # not tagged, i.e. an empty lang attribute.
@@ -1433,6 +1457,100 @@ class TestCssselect(unittest.TestCase):
         # The XHTML variant keeps element and attribute names case-sensitive.
         assert HTMLTranslator(xhtml=True).css_to_xpath("A") == ("descendant-or-self::A")
         assert HTMLTranslator().css_to_xpath("A") == ("descendant-or-self::a")
+
+    def test_lang_ranges_and_inheritance(self) -> None:
+        # A deterministic tree: inherited language, an explicit empty
+        # declaration, and script/region subtags in both positions.
+        document = etree.fromstring(
+            """
+            <root xml:lang="EN">
+              <p id="root-child"/>
+              <section xml:lang="zh-Hans-CN"><p id="zh-hans"/></section>
+              <section xml:lang="zh-Hant-TW"><p id="zh-hant"/></section>
+              <section xml:lang="en-Latn-US"><p id="en-latn-us"/></section>
+              <section xml:lang="en-US-Latn"><p id="en-us-latn"/></section>
+              <section xml:lang="de-DE"><p id="de-de"/></section>
+              <section xml:lang="de-Latn-DE"><p id="de-latn-de"/></section>
+              <section xml:lang="de-x-DE"><p id="de-x-de"/></section>
+              <section xml:lang="de-Deva"><p id="de-deva"/></section>
+              <section xml:lang="">
+                <p id="empty"><q id="empty-child"/></p>
+              </section>
+              <section xml:lang="fr-CA"><p id="fr-ca"/></section>
+            </root>
+            """
+        )
+
+        def ids(selector: str) -> list[str]:
+            xpath = GenericTranslator().css_to_xpath(selector)
+            # Compiling separately also checks that the generated expression
+            # only uses XPath 1.0 built-in functions.
+            etree.XPath(xpath)
+            items = typing.cast("list[etree._Element]", document.xpath(xpath))
+            return [element.get("id") for element in items if element.get("id")]
+
+        assert ids(":lang(EN)") == ["root-child", "en-latn-us", "en-us-latn"]
+        # RFC 4647 ignores wildcards after the first subtag and searches
+        # forward for the remaining literal subtags.
+        assert ids(':lang("*-Latn")') == [
+            "en-latn-us",
+            "en-us-latn",
+            "de-latn-de",
+        ]
+        assert ids(":lang(*-Latn)") == ids(':lang("*-Latn")')
+        assert ids(':lang("zh-*-CN")') == ["zh-hans"]
+        assert ids(':lang("zh-*")') == ["zh-hans", "zh-hant"]
+        assert ids(':lang("en-*-US")') == ["en-latn-us", "en-us-latn"]
+        assert ids(':lang("*-US-*")') == ["en-latn-us", "en-us-latn"]
+        # A singleton subtag stops the forward search, so de-x-DE fails.
+        assert ids(':lang("de-*-DE")') == ["de-de", "de-latn-de"]
+        assert ids(":lang(de-*-DE)") == ids(':lang("de-*-DE")')
+        assert ids(":lang(de-DE)") == ["de-de", "de-latn-de"]
+        assert ids(':lang("")') == ["empty", "empty-child"]
+        assert ids(":lang(fr)") == ["fr-ca"]
+        assert ids(':lang(en, "zh-Hans", "*-Latn", "")') == [
+            "root-child",
+            "zh-hans",
+            "en-latn-us",
+            "en-us-latn",
+            "de-latn-de",
+            "empty",
+            "empty-child",
+        ]
+
+        # A range list is still one pseudo-class for specificity.
+        assert parse(':lang(en, "*-Latn", "")')[0].specificity() == (0, 1, 0)
+        assert parse("div.item:lang(en, zh-Hans)")[0].specificity() == (0, 2, 1)
+
+        # HTML uses the lang attribute and the same nearest-declaration
+        # inheritance rules, including an explicit empty local override.
+        html_document = html.fromstring(
+            """
+            <div lang="EN">
+              <p id="html-inherit"/>
+              <section lang=""><p id="html-empty"/></section>
+              <section lang="zh-Hans-CN"><p id="html-zh"/></section>
+              <section lang="en-Latn-US"><p id="html-latn"/></section>
+            </div>
+            """
+        )
+
+        def html_ids(selector: str) -> list[str]:
+            xpath = HTMLTranslator().css_to_xpath(selector)
+            etree.XPath(xpath)
+            items = typing.cast("list[etree._Element]", html_document.xpath(xpath))
+            return [element.get("id") for element in items if element.get("id")]
+
+        assert html_ids(":lang(EN)") == ["html-inherit", "html-latn"]
+        assert html_ids(':lang("*-Latn")') == ["html-latn"]
+        assert html_ids(':lang("zh-Hans")') == ["html-zh"]
+        assert html_ids(':lang("")') == ["html-empty"]
+        assert html_ids(':lang(en, "zh-Hans", "*-Latn", "")') == [
+            "html-inherit",
+            "html-empty",
+            "html-zh",
+            "html-latn",
+        ]
 
     def test_argument_types(self) -> None:
         class CustomTranslator(GenericTranslator):
@@ -1488,15 +1606,14 @@ class TestCssselect(unittest.TestCase):
         )
 
     def test_html_non_ascii_lang(self) -> None:
-        # Language-range matching is ASCII case-insensitive (RFC 4647);
-        # str.lower() folds U+212A (KELVIN SIGN) into ASCII "k".
+        # RFC 4647 language ranges are ASCII-only. A non-ASCII identifier
+        # such as U+212A (KELVIN SIGN) is rejected at parse time, with its
+        # position in the selector.
         xpath = HTMLTranslator().css_to_xpath
-        assert xpath(":lang(K)") == (
-            "descendant-or-self::*[ancestor-or-self::*[@lang][1]"
-            "[starts-with(concat(translate(@lang, "
-            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
-            "'-'), 'K-')]]"
-        )
+        with pytest.raises(
+            SelectorSyntaxError, match=r"Invalid language range 'K' at 6"
+        ):
+            xpath(":lang(K)")
 
     def test_select(self) -> None:
         document = etree.fromstring(HTML_IDS)

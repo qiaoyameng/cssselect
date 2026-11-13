@@ -764,13 +764,80 @@ class GenericTranslator:
         value = cast("str", function.arguments[0].value)
         return xpath.add_condition(f"contains(., {self.xpath_literal(value)})")
 
+    def _xpath_language_tag(self) -> str:
+        """Return the lower-cased language inherited by the context element."""
+        attribute = f"ancestor-or-self::*[@{self.lang_attribute}][1]/@{self.lang_attribute}"
+        return (
+            f"translate({attribute}, {self.xpath_literal(ascii_uppercase)}, "
+            f"{self.xpath_literal(ascii_lowercase)})"
+        )
+
+    @staticmethod
+    def _xpath_first_language_subtag(tag: str) -> str:
+        return f"substring-before(concat({tag}, '-'), '-')"
+
+    @staticmethod
+    def _xpath_language_tag_rest(tag: str) -> str:
+        return f"substring-after({tag}, '-')"
+
+    def _xpath_no_singleton_subtag(self, delimited: str) -> str:
+        """Return a condition that *delimited* contains no singleton subtag."""
+        singleton_checks = [
+            f"contains({delimited}, {self.xpath_literal(f'-{char}-')})"
+            for char in ascii_lowercase + "0123456789"
+        ]
+        return "not({})".format(" or ".join(singleton_checks))
+
+    def _xpath_extended_filter(self, tag: str, subtags: list[str]) -> str:
+        """Match the remaining range subtags against the remaining tag.
+
+        RFC 4647 ignores wildcard subtags after the first one. For each other
+        subtag, Extended Filtering searches forward in the tag, but fails if it
+        encounters a singleton subtag first.
+        """
+        conditions: list[str] = []
+        remaining = tag
+        for subtag in subtags:
+            if subtag == "*":
+                continue
+            delimited = f"concat('-', {remaining}, '-')"
+            marker = self.xpath_literal(f"-{subtag}-")
+            before = f"substring-before({delimited}, {marker})"
+            after = f"substring-after({delimited}, {marker})"
+            conditions.append(f"contains({delimited}, {marker})")
+            conditions.append(self._xpath_no_singleton_subtag(f"concat({before}, '-')"))
+            remaining = f"substring({after}, 1, string-length({after}) - 1)"
+        return " and ".join(f"({condition})" for condition in conditions) or "true()"
+
+    def _xpath_language_range_condition(self, language_range: str) -> str:
+        tag = self._xpath_language_tag()
+        if not language_range:
+            return f"string-length({tag}) = 0"
+        subtags = ascii_lower(language_range).split("-")
+        first = subtags[0]
+        current = self._xpath_first_language_subtag(tag)
+        remainder = self._xpath_language_tag_rest(tag)
+        if first == "*":
+            first_matches = f"{tag} != ''"
+        else:
+            first_matches = f"({tag} != '' and {current} = {self.xpath_literal(first)})"
+        return f"({first_matches} and {self._xpath_extended_filter(remainder, subtags[1:])})"
+
     def xpath_lang_function(self, xpath: XPathExpr, function: Function) -> XPathExpr:
-        if function.argument_types() not in (["STRING"], ["IDENT"]):
+        ranges = [
+            cast("str", token.value)
+            for token in function.arguments
+            if not token.is_delim(",")
+        ]
+        if not ranges:
             raise ExpressionError(
-                f"Expected a single string or ident for :lang(), got {function.arguments!r}"
+                f"Expected one or more language ranges for :lang(), got {function.arguments!r}"
             )
-        value = cast("str", function.arguments[0].value)
-        return xpath.add_condition(f"lang({self.xpath_literal(value)})")
+        conditions = [
+            self._xpath_language_range_condition(language_range)
+            for language_range in ranges
+        ]
+        return xpath.add_condition(_or_conditions(conditions))
 
     # Pseudo: dispatch by pseudo-class name
 
@@ -952,23 +1019,6 @@ class HTMLTranslator(GenericTranslator):
             "(@checked "
             "and (name(.) = 'input' or name(.) = 'command')"
             "and (@type = 'checkbox' or @type = 'radio'))"
-        )
-
-    def xpath_lang_function(self, xpath: XPathExpr, function: Function) -> XPathExpr:
-        if function.argument_types() not in (["STRING"], ["IDENT"]):
-            raise ExpressionError(
-                f"Expected a single string or ident for :lang(), got {function.arguments!r}"
-            )
-        value = cast("str", function.arguments[0].value)
-        # Language-range matching is ASCII case-insensitive (RFC 4647),
-        # like the translate() on the document side of the comparison.
-        arg = self.xpath_literal(ascii_lower(value) + "-")
-        return xpath.add_condition(
-            "ancestor-or-self::*[@lang][1][starts-with(concat("
-            # XPath 1.0 has no lower-case function...
-            f"translate(@{self.lang_attribute}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-            "'abcdefghijklmnopqrstuvwxyz'), "
-            f"'-'), {arg})]"
         )
 
     def xpath_link_pseudo(self, xpath: XPathExpr) -> XPathExpr:
